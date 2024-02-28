@@ -1,0 +1,1 @@
+-- percona_telemetry--1.0.sql
