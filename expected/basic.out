@@ -16,10 +16,12 @@ SELECT percona_telemetry_version();
  1.0
 (1 row)
 
-SELECT waiting_on_agent FROM percona_telemetry_status();
- waiting_on_agent 
-------------------
- f
+SELECT (output_file_name IS NOT NULL) AS output_file_name,
+        (last_file_processed IS NOT NULL) AS last_file_processed,
+        waiting_on_agent FROM percona_telemetry_status();
+ output_file_name | last_file_processed | waiting_on_agent 
+------------------+---------------------+------------------
+ t                | t                   | f
 (1 row)
 
 DROP EXTENSION percona_telemetry;

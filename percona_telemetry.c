@@ -15,6 +15,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_type_d.h"
 #include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -61,7 +62,7 @@ typedef struct PTSharedState
     char dbinfo_filepath[MAXPGPATH];
     PTDatabaseInfo dbinfo;
     int json_file_indent;
-    TimestampTz last_file_produced;
+    TimestampTz last_file_processed;
     bool waiting_for_agent;
     bool last_db_entry;
 } PTSharedState;
@@ -127,6 +128,14 @@ static BgwHandleStatus setup_background_worker(const char *bgw_function_name, co
 static void start_leader(void);
 static bool last_file_exists(void);
 
+/* JSON functions */
+static bool json_state_init();
+static bool json_state_validate();
+static char *json_fix_value(char *str, int sz);
+static char *construct_json_block(char *msg_block, size_t msg_block_sz, char *key, char *value, int flags);
+static FILE *json_file_open(char *pathname, char *mode);
+static void write_json_to_file(FILE *fp, char *json_str);
+
 /* Database information collection and writing to file */
 static List *get_database_list(void);
 static List *get_extensions_list(PTDatabaseInfo *dbinfo, MemoryContext cxt);
@@ -141,7 +150,7 @@ static volatile sig_atomic_t sigterm_recvd = false;
 
 /* GUC variables */
 char *pg_telemetry_folder = NULL;
-int scrape_interval = 86400;
+int scrape_interval = HOURS_PER_DAY * MINS_PER_HOUR * SECS_PER_MINUTE;
 bool telemetry_enabled = true;
 
 /* General global variables */
@@ -168,6 +177,9 @@ pt_sigterm(SIGNAL_ARGS)
 void
 _PG_init(void)
 {
+	if (!process_shared_preload_libraries_in_progress)
+		return;
+
 	init_guc();
 
     prev_shmem_request_hook = shmem_request_hook;
@@ -216,8 +228,8 @@ percona_telemetry_status(PG_FUNCTION_ARGS)
         nulls[col_index] = true;
 
     col_index++;
-    if (ptss->last_file_produced != 0)
-        values[col_index] = TimestampTzGetDatum(ptss->last_file_produced);
+    if (ptss->last_file_processed != 0)
+        values[col_index] = TimestampTzGetDatum(ptss->last_file_processed);
     else
         nulls[col_index] = true;
 
@@ -274,7 +286,7 @@ pt_shmem_init(void)
         ptss->error_code = PT_SUCCESS;
         ptss->write_in_progress = false;
         ptss->json_file_indent = 0;
-        ptss->last_file_produced = 0;
+        ptss->last_file_processed = 0;
         ptss->waiting_for_agent = false;
         ptss->last_db_entry = false;
     }
@@ -305,11 +317,11 @@ init_guc(void)
                             "Data scrape interval",
                             NULL,
                             &scrape_interval,
-                            86400,
+                            HOURS_PER_DAY * MINS_PER_HOUR * SECS_PER_MINUTE,
                             1,
                             INT_MAX,
                             PGC_SIGHUP,
-                            0,
+                            GUC_UNIT_S,
                             NULL,
                             NULL,
                             NULL);
@@ -320,11 +332,13 @@ init_guc(void)
                              NULL,
                              &telemetry_enabled,
                              true,
-                             PGC_POSTMASTER,
+                             PGC_SIGHUP,
                              0,
                              NULL,
                              NULL,
                              NULL);
+
+    MarkGUCPrefixReserved("percona_telemetry");
 }
 
 /*
@@ -815,6 +829,7 @@ percona_telemetry_main(Datum main_arg)
     json_fix_value(json_pg_version, sizeof(json_pg_version));
 
     /* Setup signal callbacks */
+    pqsignal(SIGHUP, SignalHandlerForConfigReload);
     pqsignal(SIGTERM, pt_sigterm);
 
     /* We can now receive signals */
@@ -847,6 +862,12 @@ percona_telemetry_main(Datum main_arg)
         }
 
         CHECK_FOR_INTERRUPTS();
+
+        if (ConfigReloadPending)
+        {
+            ConfigReloadPending = false;
+            ProcessConfigFile(PGC_SIGHUP);
+        }
 
         /* Time to end the loop as the server is shutting down */
 		if ((rc & WL_POSTMASTER_DEATH) || ptss->error_code != PT_SUCCESS)
@@ -890,7 +911,7 @@ percona_telemetry_main(Datum main_arg)
             /* Let's close the file now so that processes may add their stuff. */
             fclose(fp);
 
-            ptss->last_file_produced = GetCurrentTimestamp();
+            ptss->last_file_processed = GetCurrentTimestamp();
         }
 
         /* Must be a valid list */
@@ -981,7 +1002,10 @@ percona_telemetry_main(Datum main_arg)
 
     /* Shouldn't really ever be here unless an error was encountered. So exit with the error code */
     ereport(LOG,
-            (errmsg("Percona Telemetry main (PID %d) exited due to errono %d", MyProcPid, ptss->error_code)));
+            (errmsg("Percona Telemetry main (PID %d) exited due to errono %d with enabled = %d",
+                    MyProcPid,
+                    ptss->error_code,
+                    telemetry_enabled)));
 	PT_WORKER_EXIT(PT_SUCCESS);
 }
 
