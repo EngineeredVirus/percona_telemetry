@@ -15,12 +15,10 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_type_d.h"
 #include "postmaster/bgworker.h"
-#include "postmaster/interrupt.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
-#include "utils/backend_status.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/fmgroids.h"
@@ -29,7 +27,16 @@
 #include "utils/relcache.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
+
+#if PG_VERSION_NUM >= 130000
+#include "postmaster/interrupt.h"
+#endif
+#if PG_VERSION_NUM >= 140000
+#include "utils/backend_status.h"
 #include "utils/wait_event.h"
+#else
+#include "pgstat.h"
+#endif
 
 #include <sys/stat.h>
 
@@ -118,10 +125,14 @@ PG_FUNCTION_INFO_V1(percona_telemetry_version);
 
 
 /* Internal init, shared memeory and signal functions */
-static void pt_shmem_request(void);
-static void pt_shmem_init(void);
 static void init_guc(void);
 static void pt_sigterm(SIGNAL_ARGS);
+static void pt_shmem_init(void);
+static void pt_shmem_request(void);
+
+#if PG_VERSION_NUM >= 150000
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
 
 /* Helper functions */
 static BgwHandleStatus setup_background_worker(const char *bgw_function_name, const char *bgw_name, const char *bgw_type, Oid datid, pid_t bgw_notify_pid);
@@ -143,7 +154,6 @@ static bool write_database_info(PTDatabaseInfo *dbinfo, List *extlist);
 
 /* Shared state stuff */
 static PTSharedState *ptss = NULL;
-static shmem_request_hook_type prev_shmem_request_hook = NULL;
 
 /* variable for signal handlers' variables */
 static volatile sig_atomic_t sigterm_recvd = false;
@@ -182,8 +192,12 @@ _PG_init(void)
 
 	init_guc();
 
+#if PG_VERSION_NUM >= 150000
     prev_shmem_request_hook = shmem_request_hook;
     shmem_request_hook = pt_shmem_request;
+#else
+    pt_shmem_request();
+#endif
 
 	start_leader();
 }
@@ -257,8 +271,10 @@ percona_telemetry_version(PG_FUNCTION_ARGS)
 static void
 pt_shmem_request(void)
 {
+#if PG_VERSION_NUM >= 150000
     if (prev_shmem_request_hook)
         prev_shmem_request_hook();
+#endif
 
     RequestAddinShmemSpace(MAXALIGN(sizeof(PTSharedState)));
 }
@@ -338,7 +354,9 @@ init_guc(void)
                              NULL,
                              NULL);
 
+#if PG_VERSION_NUM >= 150000
     MarkGUCPrefixReserved("percona_telemetry");
+#endif
 }
 
 /*
@@ -444,22 +462,27 @@ get_database_list(void)
     TableScanDesc scan;
     HeapTuple     tup;
     MemoryContext oldcxt;
+    ScanKeyData   key[1];
 
     /* Start a transaction to access pg_database */
     StartTransactionCommand();
 
     rel = relation_open(DatabaseRelationId, AccessShareLock);
-    scan = table_beginscan_catalog(rel, 0, NULL);
+
+    /* Ignore databases that we can't connect to */
+    ScanKeyInit(&key[0],
+                Anum_pg_database_datallowconn,
+                BTEqualStrategyNumber,
+                F_BOOLEQ,
+                BoolGetDatum(true));
+
+    scan = table_beginscan_catalog(rel, 0, &key[0]);
 
     while (HeapTupleIsValid(tup = heap_getnext(scan, ForwardScanDirection)))
     {
         PTDatabaseInfo  *dbinfo;
         int64 datsize;
         Form_pg_database pgdatabase = (Form_pg_database) GETSTRUCT(tup);
-
-        /* Ignore the template database as we can't connect to it */
-        if (pgdatabase->oid < PostgresDbOid)
-            continue;
 
         datsize = DatumGetInt64(DirectFunctionCall1(pg_database_size_oid, ObjectIdGetDatum(pgdatabase->oid)));
 
@@ -829,8 +852,12 @@ percona_telemetry_main(Datum main_arg)
     json_fix_value(json_pg_version, sizeof(json_pg_version));
 
     /* Setup signal callbacks */
-    pqsignal(SIGHUP, SignalHandlerForConfigReload);
     pqsignal(SIGTERM, pt_sigterm);
+#if PG_VERSION_NUM >= 130000
+    pqsignal(SIGHUP, SignalHandlerForConfigReload);
+#else
+    pqsignal(SIGHUP, PostgresSigHupHandler);
+#endif
 
     /* We can now receive signals */
     BackgroundWorkerUnblockSignals();
@@ -921,7 +948,11 @@ percona_telemetry_main(Datum main_arg)
             BgwHandleStatus status;
 
             /* First or the next cell */
+#if PG_VERSION_NUM >= 130000
             lc = (lc) ? lnext(dblist, lc) : list_head(dblist);
+#else
+            lc = (lc) ? lnext(lc) : list_head(dblist);
+#endif
 
             /*
              * We've reached end of the list. So, let's cleanup and go to

@@ -21,6 +21,7 @@ BEGIN
 
     -- If we have more than 6 consecutive digits, it's file size unlike to be an OID
     SELECT regexp_replace(file_content, '\d{6,}', '<DB SIZE>', 'g') INTO file_content;
+    SELECT regexp_replace(file_content, '\d{1,}', '<DB OID>', 'g') INTO file_content;
 
     RETURN file_content;
 END;
@@ -50,7 +51,7 @@ SELECT read_json_file();
              "value": [                      +
                {                             +
                  "key": "database_oid",      +
-                 "value": "5"                +
+                 "value": "<DB OID>"         +
                },                            +
                {                             +
                  "key": "database_size",     +
@@ -64,7 +65,24 @@ SELECT read_json_file();
                      "value": "plpgsql"      +
                    }                         +
                  ]                           +
-               }                             +
+               },                            +
+               {                             +
+                 "key": "database_oid",      +
+                 "value": "<DB OID>"         +
+               },                            +
+               {                             +
+                 "key": "database_size",     +
+                 "value": "<DB SIZE>"        +
+               },                            +
+               {                             +
+                 "key": "active_extensions", +
+                 "value": [                  +
+                   {                         +
+                     "key": "extension_name",+
+                     "value": "plpgsql"      +
+                   }                         +
+                 ]                           +
+               },                            +
              ]                               +
            }                                 +
  
