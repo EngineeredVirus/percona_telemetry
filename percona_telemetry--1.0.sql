@@ -6,6 +6,7 @@ AS 'MODULE_PATHNAME'
 LANGUAGE C PARALLEL SAFE;
 
 CREATE FUNCTION percona_telemetry_status(
+    OUT output_file_name        text,
     OUT last_file_processed     timestamptz,
     OUT waiting_on_agent        boolean)
 RETURNS record

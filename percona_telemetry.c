@@ -191,28 +191,38 @@ start_leader(void)
 Datum
 percona_telemetry_status(PG_FUNCTION_ARGS)
 {
-#define PT_STATUS_COLUMN_COUNT  2
+#define PT_STATUS_COLUMN_COUNT  3
 
     TupleDesc tupdesc;
     Datum values[PT_STATUS_COLUMN_COUNT];
     bool nulls[PT_STATUS_COLUMN_COUNT] = {false};
     HeapTuple tup;
     Datum result;
+    int col_index = 0;
 
     /* Initialize shmem */
     pt_shmem_init();
 
     tupdesc = CreateTemplateTupleDesc(PT_STATUS_COLUMN_COUNT);
-    TupleDescInitEntry(tupdesc, (AttrNumber) 1, "last_file_processed", TIMESTAMPTZOID, -1, 0);
-    TupleDescInitEntry(tupdesc, (AttrNumber) 2, "waiting_on_agent", BOOLOID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber) 1, "output_file_name", TEXTOID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber) 2, "last_file_processed", TIMESTAMPTZOID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber) 3, "waiting_on_agent", BOOLOID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
 
-    if (ptss->last_file_produced != 0)
-        values[0] = TimestampTzGetDatum(ptss->last_file_produced);
+    col_index = 0;
+    if (ptss->dbinfo_filepath[0] != '\0')
+        values[col_index] = CStringGetTextDatum(ptss->dbinfo_filepath);
     else
-        nulls[0] = true;
+        nulls[col_index] = true;
 
-    values[1] = BoolGetDatum(ptss->waiting_for_agent);
+    col_index++;
+    if (ptss->last_file_produced != 0)
+        values[col_index] = TimestampTzGetDatum(ptss->last_file_produced);
+    else
+        nulls[col_index] = true;
+
+    col_index++;
+    values[col_index] = BoolGetDatum(ptss->waiting_for_agent);
 
     tup = heap_form_tuple(tupdesc, values, nulls);
     result = HeapTupleGetDatum(tup);
