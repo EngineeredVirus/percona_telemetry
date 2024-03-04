@@ -1,0 +1,25 @@
+--
+-- basic sanity
+--
+CREATE EXTENSION percona_telemetry;
+SELECT name FROM pg_settings WHERE name LIKE 'percona_telemetry.%';
+                 name                  
+---------------------------------------
+ percona_telemetry.enabled
+ percona_telemetry.pg_telemetry_folder
+ percona_telemetry.scrape_interval
+(3 rows)
+
+SELECT percona_telemetry_version();
+ percona_telemetry_version 
+---------------------------
+ 1.0
+(1 row)
+
+SELECT waiting_on_agent FROM percona_telemetry_status();
+ waiting_on_agent 
+------------------
+ f
+(1 row)
+
+DROP EXTENSION percona_telemetry;

@@ -1,5 +1,6 @@
 #include "postgres.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "pg_config.h"
 
@@ -12,12 +13,14 @@
 #include "commands/dbcommands.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_type_d.h"
 #include "postmaster/bgworker.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
 #include "utils/backend_status.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
@@ -58,11 +61,14 @@ typedef struct PTSharedState
     char dbinfo_filepath[MAXPGPATH];
     PTDatabaseInfo dbinfo;
     int json_file_indent;
+    TimestampTz last_file_produced;
+    bool waiting_for_agent;
     bool last_db_entry;
 } PTSharedState;
 
 /* General defines */
-#define PT_FILENAME_BASE "percona_telemetry"
+#define PT_BUILD_VERSION    "1.0"
+#define PT_FILENAME_BASE    "percona_telemetry"
 
 /* JSON formatting defines */
 #define PT_INDENT_SIZE      2 + (5 * 2)
@@ -106,6 +112,10 @@ void _PG_init(void);
 PGDLLEXPORT void percona_telemetry_main(Datum);
 PGDLLEXPORT void percona_telemetry_worker(Datum);
 
+PG_FUNCTION_INFO_V1(percona_telemetry_status);
+PG_FUNCTION_INFO_V1(percona_telemetry_version);
+
+
 /* Internal init, shared memeory and signal functions */
 static void pt_shmem_request(void);
 static void pt_shmem_init(void);
@@ -114,6 +124,7 @@ static void pt_sigterm(SIGNAL_ARGS);
 
 /* Helper functions */
 static BgwHandleStatus setup_background_worker(const char *bgw_function_name, const char *bgw_name, const char *bgw_type, Oid datid, pid_t bgw_notify_pid);
+static void start_leader(void);
 static bool last_file_exists(void);
 
 /* Database information collection and writing to file */
@@ -162,7 +173,60 @@ _PG_init(void)
     prev_shmem_request_hook = shmem_request_hook;
     shmem_request_hook = pt_shmem_request;
 
-	setup_background_worker("percona_telemetry_main", "percona_telemetry leader", "percona_telemetry leader", InvalidOid, 0);
+	start_leader();
+}
+
+/*
+ * Start the leader process
+ */
+static void
+start_leader(void)
+{
+    setup_background_worker("percona_telemetry_main", "percona_telemetry leader", "percona_telemetry leader", InvalidOid, 0);
+}
+
+/*
+ * Select the status of percona_telemetry.
+ */
+Datum
+percona_telemetry_status(PG_FUNCTION_ARGS)
+{
+#define PT_STATUS_COLUMN_COUNT  2
+
+    TupleDesc tupdesc;
+    Datum values[PT_STATUS_COLUMN_COUNT];
+    bool nulls[PT_STATUS_COLUMN_COUNT] = {false};
+    HeapTuple tup;
+    Datum result;
+
+    /* Initialize shmem */
+    pt_shmem_init();
+
+    tupdesc = CreateTemplateTupleDesc(PT_STATUS_COLUMN_COUNT);
+    TupleDescInitEntry(tupdesc, (AttrNumber) 1, "last_file_processed", TIMESTAMPTZOID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber) 2, "waiting_on_agent", BOOLOID, -1, 0);
+    tupdesc = BlessTupleDesc(tupdesc);
+
+    if (ptss->last_file_produced != 0)
+        values[0] = TimestampTzGetDatum(ptss->last_file_produced);
+    else
+        nulls[0] = true;
+
+    values[1] = BoolGetDatum(ptss->waiting_for_agent);
+
+    tup = heap_form_tuple(tupdesc, values, nulls);
+    result = HeapTupleGetDatum(tup);
+
+	PG_RETURN_DATUM(result);
+}
+
+/*
+ * Select the version of percona_telemetry.
+ */
+Datum
+percona_telemetry_version(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(cstring_to_text(PT_BUILD_VERSION));
 }
 
 /*
@@ -200,6 +264,8 @@ pt_shmem_init(void)
         ptss->error_code = PT_SUCCESS;
         ptss->write_in_progress = false;
         ptss->json_file_indent = 0;
+        ptss->last_file_produced = 0;
+        ptss->waiting_for_agent = false;
         ptss->last_db_entry = false;
     }
 
@@ -239,7 +305,7 @@ init_guc(void)
                             NULL);
 
     /* is the extension enabled? */
-    DefineCustomBoolVariable("percona_telemetry.enable",
+    DefineCustomBoolVariable("percona_telemetry.enabled",
                              "Enable or disable the percona_telemetry extension",
                              NULL,
                              &telemetry_enabled,
@@ -314,9 +380,12 @@ last_file_exists(void)
 {
     struct stat st;
 
+    /* Assume we are not waiting for the agent. */
+    ptss->waiting_for_agent = false;
+
     /* We didn't create a file yet. */
     if (ptss->dbinfo_filepath[0] == '\0')
-        return false;
+        return ptss->waiting_for_agent;
 
     /* Previous file was not picked up by the agent. */
     if (stat(ptss->dbinfo_filepath, &st) == 0)
@@ -326,17 +395,18 @@ last_file_exists(void)
         /* Possible case of path corruption as the file path is now a directory */
         if (is_dir)
         {
-            ereport(LOG, (errcode_for_file_access(),
-                          errmsg("file path \"%s\" is now a directory: %m", ptss->dbinfo_filepath)));
+            ereport(LOG,
+                    (errcode_for_file_access(),
+                     errmsg("file path \"%s\" is not a directory: %m", ptss->dbinfo_filepath)));
 
             ptss->error_code = PT_FILE_ERROR;
         }
 
-        return true;
+        ptss->waiting_for_agent = true;
     }
 
     /* Previous file was not found. So we're all good. */
-    return false;
+    return ptss->waiting_for_agent;
 }
 
 /*
@@ -599,14 +669,18 @@ json_file_open(char *pathname, char *mode)
 
     if (is_dir == false)
     {
-        ereport(WARNING, (errmsg("percont_telemetry.pg_telemetry_folder \"%s\" is not set to a writeable folder or the folder does not exist.", pathname)));
+        ereport(LOG,
+                (errcode_for_file_access(),
+                 errmsg("percont_telemetry.pg_telemetry_folder \"%s\" is not set to a writeable folder or the folder does not exist.", pathname)));
         PT_WORKER_EXIT(PT_FILE_ERROR);
     }
 
     fp = fopen(pathname, mode);
     if (fp == NULL)
 	{
-        ereport(WARNING, (errmsg("Could not open file %s for writing.", pathname)));
+        ereport(LOG,
+                (errcode_for_file_access(),
+                 errmsg("Could not open file %s for writing.", pathname)));
         PT_WORKER_EXIT(PT_FILE_ERROR);
     }
 
@@ -627,7 +701,9 @@ write_json_to_file(FILE *fp, char *json_str)
 
     if (len != bytes_written)
     {
-        ereport(WARNING, (errmsg("Could not write to json file.")));
+        ereport(LOG,
+                (errcode_for_file_access(),
+                 errmsg("Could not write to json file.")));
 
         fclose(fp);
         PT_WORKER_EXIT(PT_FILE_ERROR);
@@ -699,7 +775,9 @@ write_database_info(PTDatabaseInfo *dbinfo, List *extlist)
     /* Validate JSON state. */
     if (json_state_validate() == false)
     {
-        ereport(INFO, (errmsg("Malformed JSON created. Aborting.")));
+        ereport(LOG,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("percona_telemetry: malformed json created.")));
         PT_WORKER_EXIT(PT_JSON_ERROR);
     }
 
@@ -801,6 +879,8 @@ percona_telemetry_main(Datum main_arg)
 
             /* Let's close the file now so that processes may add their stuff. */
             fclose(fp);
+
+            ptss->last_file_produced = GetCurrentTimestamp();
         }
 
         /* Must be a valid list */
@@ -845,7 +925,9 @@ percona_telemetry_main(Datum main_arg)
                 /* Validate JSON state. */
                 if (json_state_validate() == false)
                 {
-                    ereport(INFO, (errmsg("Malformed JSON created. Aborting.")));
+                    ereport(LOG,
+                            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                             errmsg("percona_telemetry: malformed json created.")));
 
                     ptss->error_code = PT_FILE_ERROR;
                     break;
@@ -856,7 +938,7 @@ percona_telemetry_main(Datum main_arg)
 	            {
                     ereport(LOG,
                             (errcode_for_file_access(),
-                            errmsg("could not rename file \"%s\" to \"%s\": %m",
+                             errmsg("could not rename file \"%s\" to \"%s\": %m",
                                     ptss->dbtemp_filepath,
                                     ptss->dbinfo_filepath)));
 
@@ -871,7 +953,6 @@ percona_telemetry_main(Datum main_arg)
             ptss->last_db_entry = (list_tail(dblist) == lc);
             dbinfo = lfirst(lc);
             memcpy(&ptss->dbinfo, dbinfo, sizeof(PTDatabaseInfo));
-            ereport(LOG, (errmsg("About to run a worker %d", ptss->dbinfo.datid)));
 
             /*
              * Run the dynamic background worker and wait for it's completion
@@ -889,7 +970,8 @@ percona_telemetry_main(Datum main_arg)
     }
 
     /* Shouldn't really ever be here unless an error was encountered. So exit with the error code */
-    ereport(LOG, (errmsg("Percona Telemetry main (PID %d) exited due to errono %d", MyProcPid, ptss->error_code)));
+    ereport(LOG,
+            (errmsg("Percona Telemetry main (PID %d) exited due to errono %d", MyProcPid, ptss->error_code)));
 	PT_WORKER_EXIT(PT_SUCCESS);
 }
 
@@ -909,8 +991,6 @@ percona_telemetry_worker(Datum main_arg)
     /* Initialize shmem */
     pt_shmem_init();
     Assert(datid != InvalidOid && ptss->dbinfo.datid == datid);
-
-    ereport(LOG, (errmsg("Worker Running for database %d", datid)));
 
     /* Set up connection */
     BackgroundWorkerInitializeConnectionByOid(datid, InvalidOid, 0);
