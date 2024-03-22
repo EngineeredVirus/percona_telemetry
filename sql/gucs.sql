@@ -24,4 +24,8 @@ SELECT application_name, backend_type, (backend_start IS NOT NULL) AS backend_st
 FROM pg_stat_activity
 WHERE application_name = 'percona_telemetry';
 
+ALTER SYSTEM RESET percona_telemetry.enabled;
+ALTER SYSTEM RESET percona_telemetry.scrape_interval;
+SELECT pg_reload_conf();
+
 DROP EXTENSION percona_telemetry;

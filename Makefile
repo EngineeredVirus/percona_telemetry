@@ -13,10 +13,6 @@ PGFILEDESC = "percona_telemetry - extension for Percona telemetry data collectio
 REGRESS_OPTS = --temp-config $(top_srcdir)/contrib/percona_telemetry/percona_telemetry.conf
 REGRESS = basic debug_json gucs
 
-# Disabled because these regression tests require the lib to be added to
-# shared preload libraries, which typical installcheck users do not have.
-NO_INSTALLCHECK = 1
-
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
