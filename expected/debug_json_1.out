@@ -99,7 +99,7 @@ SELECT read_json_file();
                      "value": "plpgsql"      +
                    }                         +
                  ]                           +
-               },                            +
+               }                             +
              ]                               +
            }                                 +
  
