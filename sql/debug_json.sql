@@ -15,17 +15,8 @@ BEGIN
     SELECT system_identifier::TEXT INTO system_id FROM pg_control_system();
     SELECT version() INTO pg_version;
 
-    file_content := pg_read_file(file_path);
-
-    SELECT REPLACE(file_content, system_id, '<SYSTEM IDENTIFIER>') INTO file_content;
-    SELECT REPLACE(file_content, pg_version, '<PG VERSION>') INTO file_content;
-
-    -- If we have more than 6 consecutive digits, it's file size unlike to be an OID
-    SELECT regexp_replace(file_content, 'archive_cleanup_command.*', 'archive_cleanup_command', 'g') INTO file_content;
-    SELECT regexp_replace(file_content, '\d{2}:\d{2}:\d{2}.\d{6}', '<SERVER UPTIME>', 'g') INTO file_content;
-    SELECT regexp_replace(file_content, '\d{2}\.\d{1,2}', '<PG VERSION>', 'g') INTO file_content;
-    SELECT regexp_replace(file_content, '\d{6,}', '<DB SIZE>', 'g') INTO file_content;
-    SELECT regexp_replace(file_content, '\d{1,}', '<DB OID>', 'g') INTO file_content;
+    -- file_content := to_json('{' || pg_read_file(file_path) || '}');
+    file_content := '{' || pg_read_file(file_path) || '}';
 
     RETURN file_content;
 END;
@@ -36,7 +27,11 @@ $$ LANGUAGE plpgsql;
 SELECT pg_sleep(3);
 
 CREATE EXTENSION percona_telemetry;
-SELECT read_json_file();
-DROP EXTENSION percona_telemetry;
 
+SELECT 'db_instance_id' AS col FROM pg_control_system() WHERE '"' || system_identifier || '"' = (SELECT cast(read_json_file()::JSON->'db_instance_id' AS VARCHAR));
+SELECT 'pillar_version' AS col WHERE '"' || current_setting('server_version') || '"' = (SELECT cast(read_json_file()::JSON->'pillar_version' AS VARCHAR));
+SELECT 'databases_count' AS col FROM pg_database WHERE datallowconn = true HAVING '"' || count(*) || '"' = (SELECT cast(read_json_file()::JSON->'databases_count' AS VARCHAR));
+SELECT 'settings' AS col FROM pg_settings WHERE name NOT LIKE 'plpgsql.%' HAVING count(*) = (SELECT json_array_length(read_json_file()::JSON->'settings'));
+
+DROP EXTENSION percona_telemetry;
 DROP FUNCTION read_json_file;
