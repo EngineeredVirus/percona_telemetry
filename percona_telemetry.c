@@ -1,32 +1,37 @@
 #include "postgres.h"
 #include "fmgr.h"
 #include "funcapi.h"
-#include "miscadmin.h"
 #include "pg_config.h"
+#include "utils/guc_tables.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/relscan.h"
 #include "access/table.h"
 #include "access/tableam.h"
-#include "access/xact.h"
 #include "commands/dbcommands.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_namespace_d.h"
 #include "catalog/pg_type_d.h"
+#include "executor/spi.h"
 #include "postmaster/bgworker.h"
 #include "storage/fd.h"
-#include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
+
+#include "percona_telemetry.h"
+#include "pt_json.h"
 
 #if PG_VERSION_NUM >= 130000
 #include "postmaster/interrupt.h"
@@ -42,78 +47,9 @@
 
 PG_MODULE_MAGIC;
 
-/* Struct to keep track of databases telemetry data */
-typedef struct PTDatabaseInfo
-{
-    Oid  datid;
-    char datname[NAMEDATALEN];
-    int64 datsize;
-} PTDatabaseInfo;
-
-/* Struct to keep track of extensions of a database */
-typedef struct PTExtensionInfo
-{
-    char     extname[NAMEDATALEN];
-    PTDatabaseInfo *db_data;
-} PTExtensionInfo;
-
-/*
- * Shared state to telemetry. We don't need any locks as we run only one
- * background worker at a time which may update this in case of an error.
- */
-typedef struct PTSharedState
-{
-    int error_code;
-    bool write_in_progress;
-    char dbtemp_filepath[MAXPGPATH];
-    char dbinfo_filepath[MAXPGPATH];
-    PTDatabaseInfo dbinfo;
-    int json_file_indent;
-    TimestampTz last_file_processed;
-    bool waiting_for_agent;
-    bool last_db_entry;
-} PTSharedState;
-
 /* General defines */
 #define PT_BUILD_VERSION    "1.0"
 #define PT_FILENAME_BASE    "percona_telemetry"
-
-/* JSON formatting defines */
-#define PT_INDENT_SIZE      2 + (5 * 2)
-#define PT_FORMAT_JSON(dest, dest_size, str, indent_size)       \
-            pg_snprintf(dest, dest_size, "%*s%s\n",             \
-                        (indent_size) * PT_INDENT_SIZE, "", str)
-
-#define PT_JSON_BLOCK_START             1
-#define PT_JSON_BLOCK_END               1 << 1
-#define PT_JSON_BLOCK_LAST              1 << 3
-#define PT_JSON_BLOCK_KEY               1 << 4
-#define PT_JSON_BLOCK_VALUE             1 << 5
-#define PT_JSON_ARRAY_START             1 << 6
-#define PT_JSON_ARRAY_END               1 << 7
-
-#define PT_JSON_BLOCK_EMPTY             (PT_JSON_BLOCK_START | PT_JSON_BLOCK_END)
-#define PT_JSON_BLOCK_SIMPLE            (PT_JSON_BLOCK_EMPTY | PT_JSON_BLOCK_KEY | PT_JSON_BLOCK_VALUE)
-#define PT_JSON_BLOCK_ARRAY_VALUE       (PT_JSON_BLOCK_START | PT_JSON_BLOCK_KEY | PT_JSON_ARRAY_START)
-
-static int json_blocks_started = 0;
-static int json_arrays_started = 0;
-
-/* Defining error codes */
-#define PT_SUCCESS          0
-#define PT_DB_ERROR         1
-#define PT_FILE_ERROR       2
-#define PT_JSON_ERROR       3
-
-/* Must use to exit a background worker process. */
-#define PT_WORKER_EXIT(e_code)                  \
-{                                               \
-    if (IsTransactionBlock())                   \
-        CommitTransactionCommand();             \
-    if (e_code != PT_SUCCESS && ptss)           \
-        ptss->error_code = e_code;              \
-    proc_exit(0);                               \
-}
 
 /* Init and exported functions */
 void _PG_init(void);
@@ -138,16 +74,10 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static BgwHandleStatus setup_background_worker(const char *bgw_function_name, const char *bgw_name, const char *bgw_type, Oid datid, pid_t bgw_notify_pid);
 static void start_leader(void);
 static bool last_file_exists(void);
-
-/* JSON functions */
-static bool json_state_init();
-static bool json_state_validate();
-static char *json_fix_value(char *str, int sz);
-static char *construct_json_block(char *msg_block, size_t msg_block_sz, char *key, char *value, int flags);
-static FILE *json_file_open(char *pathname, char *mode);
-static void write_json_to_file(FILE *fp, char *json_str);
+static char *server_uptime(void);
 
 /* Database information collection and writing to file */
+static void write_pg_settings(void);
 static List *get_database_list(void);
 static List *get_extensions_list(PTDatabaseInfo *dbinfo, MemoryContext cxt);
 static bool write_database_info(PTDatabaseInfo *dbinfo, List *extlist);
@@ -159,7 +89,7 @@ static PTSharedState *ptss = NULL;
 static volatile sig_atomic_t sigterm_recvd = false;
 
 /* GUC variables */
-char *pg_telemetry_folder = NULL;
+char *pt_telemetry_folder = NULL;
 int scrape_interval = HOURS_PER_DAY * MINS_PER_HOUR * SECS_PER_MINUTE;
 bool telemetry_enabled = true;
 
@@ -200,15 +130,110 @@ _PG_init(void)
 #endif
 
 	start_leader();
+
+    // TimestampTz t = GetCurrentTimestamp();
+    // ereport(LOG, (errmsg("GetCurrentTimestamp() => %ld", (int64)GetCurrentTimestamp())));
 }
 
 /*
- * Start the leader process
+ * Start the launcher process
  */
 static void
 start_leader(void)
 {
-    setup_background_worker("percona_telemetry_main", "percona_telemetry leader", "percona_telemetry leader", InvalidOid, 0);
+    setup_background_worker("percona_telemetry_main", "percona_telemetry launcher", "percona_telemetry launcher", InvalidOid, 0);
+}
+
+/*
+ *
+ */
+static char *
+generate_filename(char *filename)
+{
+// 	struct timeval tp;
+// 	char		templ[128];
+// 	char		buf[128];
+// 	pg_time_t	tt;
+
+// GetCurrentTimestamp();
+
+// 	gettimeofday(&tp, NULL);
+// 	tt = (pg_time_t) tp.tv_sec;
+// 	pg_strftime(templ, sizeof(templ), "+%s", pg_localtime(&tt, session_timezone));
+// 	snprintf(buf, sizeof(buf), templ, tp.tv_usec);
+
+    return filename;
+}
+
+/*
+ *
+ */
+static void
+cleaup_telemetry_dir()
+{
+    // DIR *d;
+    // d = AllocateDir(pt_telemetry_folder);
+    // struct dirent *de;
+    // uint64 system_id = GetSystemIdentifier();
+    // char json_file_id[MAXPGPATH];
+    // char temp_file_id[MAXPGPATH];
+    // int file_id_len;
+
+    // if (d == NULL)
+    // {
+    //     ereport(elevel,
+    //                     (errcode_for_file_access(),
+    //                         errmsg("could not open percona telemetry directory \"%s\": %m",
+    //                                     pt_)));
+    //     *err_msg = psprintf("could not open directory \"%s\"", pt_telemetry_folder);
+    // }
+
+    // pg_snprintf(json_file_id, sizeof(json_file_id), "-%lu.json", system_id);
+    // pg_snprintf(temp_file_id, sizeof(temp_file_id), "-%lu.temp", system_id);
+
+    // file_id_len = strlen(json_file_id);
+    // Assert(file_id_len == strlen(temp_file_id));
+
+    // while (de = ReadDir(d, pt_telemetry_folder))
+    // {
+    //     PGFileType t;
+    //     char filename[MAXPGPATH];
+
+    //     /* Ignore . and .. */
+    //     if (d_namlen <= json_id_len)
+    //         continue;
+
+    //     if (strcmp(de->d_name + de->d_namlen - file_id_len, json_file_id) == 0)
+    //     {
+
+    //     }
+    //     else if (strcmp(de->d_name + de->d_namlen - file_id_len, temp_file_id) == 0)
+    //     {
+
+    //     }
+    // }
+}
+
+//pt_telemetry_folder
+bool
+is_valid_dir(char *folder_path)
+{
+    struct stat st;
+    bool is_dir = false;
+
+    /* Let's validate the path. */
+    if (stat(folder_path, &st) == 0)
+    {
+        is_dir = S_ISDIR(st.st_mode);
+    }
+
+    if (is_dir == false)
+    {
+        ereport(LOG,
+                (errcode_for_file_access(),
+                 errmsg("percont_telemetry.pt_telemetry_folder \"%s\" is not set to a writeable folder or the folder does not exist.", folder_path)));
+        PT_WORKER_EXIT(PT_FILE_ERROR);
+    }
 }
 
 /*
@@ -295,8 +320,8 @@ pt_shmem_init(void)
         uint64 system_id = GetSystemIdentifier();
 
         /* Set paths */
-        pg_snprintf(ptss->dbtemp_filepath, sizeof(ptss->dbtemp_filepath), "%s/%s-%lu.temp", pg_telemetry_folder, PT_FILENAME_BASE, system_id);
-        pg_snprintf(ptss->dbinfo_filepath, sizeof(ptss->dbinfo_filepath), "%s/%s-%lu.json", pg_telemetry_folder, PT_FILENAME_BASE, system_id);
+        pg_snprintf(ptss->dbtemp_filepath, sizeof(ptss->dbtemp_filepath), "%s/%s-%lu.temp", pt_telemetry_folder, PT_FILENAME_BASE, system_id);
+        pg_snprintf(ptss->dbinfo_filepath, sizeof(ptss->dbinfo_filepath), "%s/%s-%lu.json", pt_telemetry_folder, PT_FILENAME_BASE, system_id);
 
         /* Let's be optimistic here. No error code and no file currently being written. */
         ptss->error_code = PT_SUCCESS;
@@ -304,6 +329,7 @@ pt_shmem_init(void)
         ptss->json_file_indent = 0;
         ptss->last_file_processed = 0;
         ptss->waiting_for_agent = false;
+        ptss->first_db_entry = false;
         ptss->last_db_entry = false;
     }
 
@@ -317,10 +343,10 @@ static void
 init_guc(void)
 {
     /* file path */
-    DefineCustomStringVariable("percona_telemetry.pg_telemetry_folder",
+    DefineCustomStringVariable("percona_telemetry.pt_telemetry_folder",
                                "Directory path for writing database info file(s)",
                                NULL,
-                               &pg_telemetry_folder,
+                               &pt_telemetry_folder,
                                "/usr/local/percona/telemetry/pg",
                                PGC_SIGHUP,
                                0,
@@ -328,7 +354,7 @@ init_guc(void)
                                NULL,
                                NULL);
 
-    /* scan time interval for the main leader process */
+    /* scan time interval for the main launch process */
     DefineCustomIntVariable("percona_telemetry.scrape_interval",
                             "Data scrape interval",
                             NULL,
@@ -365,7 +391,7 @@ init_guc(void)
  * up with multiple background workers and prevents overloading system
  * resources. So, we process databases sequentially which is fine.
  *
- * datid is ignored for leader which is identified by a notify_pid = 0
+ * datid is ignored for launcher which is identified by a notify_pid = 0
  */
 static BgwHandleStatus
 setup_background_worker(const char *bgw_function_name, const char *bgw_name, const char *bgw_type, Oid datid, pid_t bgw_notify_pid)
@@ -384,7 +410,7 @@ setup_background_worker(const char *bgw_function_name, const char *bgw_name, con
     worker.bgw_main_arg = ObjectIdGetDatum(datid);
     worker.bgw_notify_pid = bgw_notify_pid;
 
-    /* Case of a leader */
+    /* Case of a launcher */
     if (bgw_notify_pid == 0)
     {
         /* Leader should never connect to a valid database. */
@@ -452,6 +478,147 @@ last_file_exists(void)
 }
 
 /*
+ * Returns string contain server uptime in interval representation
+ * hh:mm:ss.mmmmmm => Hours : Minutes : Seconds . Microseconds
+ */
+static char *
+server_uptime(void)
+{
+    TimestampTz start_time;
+    TimestampTz current_time;
+    Interval *uptime;
+
+    /* Calculate uptime */
+    start_time = PgStartTime;
+    current_time = GetCurrentTimestamp();
+
+    uptime = DatumGetIntervalP(DirectFunctionCall2(timestamp_mi, TimestampTzGetDatum(current_time), TimestampTzGetDatum(start_time)));
+
+    /* Return uptime as a string */
+    return DatumGetCString(DirectFunctionCall1(interval_out, PointerGetDatum(uptime)));
+}
+
+/*
+ * Getting pg_settings values:
+ * -> name, units, setting, boot_val, and reset_val
+ */
+
+#define PT_SETTINGS_COL_COUNT 5
+
+static void
+write_pg_settings(void)
+{
+    SPITupleTable *tuptable;
+    int spi_result;
+    char *query = "SELECT name, unit, setting, reset_val, boot_val FROM pg_settings";
+    char msg[2048] = {0};
+    char msg_json[4096] = {0};
+    size_t sz_json;
+    FILE *fp;
+    int flags;
+
+    sz_json = sizeof(msg_json);
+
+    /* Open file in append mode. */
+    fp = json_file_open(ptss->dbtemp_filepath, "a+");
+
+    /* Initialize JSON state. */
+    json_state_init();
+
+    /* Construct and initiate the active extensions array block. */
+    construct_json_block(msg_json, sz_json, "", "settings", PT_JSON_ARRAY_START, &ptss->json_file_indent);
+    write_json_to_file(fp, msg_json);
+
+    SetCurrentStatementStartTimestamp();
+    StartTransactionCommand();
+
+    /* Initialize SPI */
+    if (SPI_connect() != SPI_OK_CONNECT)
+    {
+        ereport(ERROR, (errmsg("Failed to connect to SPI")));
+    }
+
+    PushActiveSnapshot(GetTransactionSnapshot());
+
+    /* Execute the query */
+    spi_result = SPI_execute(query, true, 0);
+    if (spi_result != SPI_OK_SELECT)
+    {
+        SPI_finish();
+        ereport(ERROR, (errmsg("Query failed execution.")));
+    }
+
+    /* Process the result */
+    if (SPI_processed > 0)
+    {
+        tuptable = SPI_tuptable;
+
+        for (int row_count = 0; row_count < SPI_processed; row_count++)
+        {
+            char *null_value = "NULL";
+            char  *value_str[PT_SETTINGS_COL_COUNT];
+
+
+            /* Construct and initiate the active extensions array block. */
+            construct_json_block(msg_json, sz_json, "setting", "", PT_JSON_BLOCK_ARRAY_VALUE, &ptss->json_file_indent);
+            write_json_to_file(fp, msg_json);
+
+            /* Process the tuple as needed */
+            for (int col_count = 1; col_count <= tuptable->tupdesc->natts; col_count++)
+            {
+                char *str = SPI_getvalue(tuptable->vals[row_count], tuptable->tupdesc, col_count);
+                value_str[col_count - 1] = (str == NULL || str[0] == '\0') ? null_value : str;
+
+                flags = (col_count == tuptable->tupdesc->natts) ? (PT_JSON_BLOCK_SIMPLE | PT_JSON_BLOCK_LAST) : PT_JSON_BLOCK_SIMPLE;
+
+                construct_json_block(msg_json, sz_json, NameStr(tuptable->tupdesc->attrs[col_count - 1].attname),
+                                            value_str[col_count - 1], flags, &ptss->json_file_indent);
+                write_json_to_file(fp, msg_json);
+            }
+
+            /* Close the array */
+            construct_json_block(msg, sizeof(msg), "setting", "", PT_JSON_ARRAY_END | PT_JSON_BLOCK_LAST, &ptss->json_file_indent);
+            strcpy(msg_json, msg);
+
+            /* Close the extension block */
+            flags = (row_count == (SPI_processed - 1)) ? (PT_JSON_BLOCK_END | PT_JSON_BLOCK_LAST) : PT_JSON_BLOCK_END;
+            construct_json_block(msg, sizeof(msg), "setting", "", flags, &ptss->json_file_indent);
+            strlcat(msg_json, msg, sz_json);
+
+            /* Write both to file. */
+            write_json_to_file(fp, msg_json);
+        }
+    }
+
+    /* Close the array */
+    construct_json_block(msg, sizeof(msg), "settings", "", PT_JSON_ARRAY_END, &ptss->json_file_indent);
+    strcpy(msg_json, msg);
+
+    /* Write both to file. */
+    write_json_to_file(fp, msg_json);
+
+    /* Clean up */
+    fclose(fp);
+
+    /* Validate JSON state. */
+    if (json_state_validate() == false)
+    {
+        ereport(LOG,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("percona_telemetry: malformed json created.")));
+        PT_WORKER_EXIT(PT_JSON_ERROR);
+    }
+
+    /* Disconnect from SPI */
+    SPI_finish();
+
+    PopActiveSnapshot();
+    CommitTransactionCommand();
+}
+
+#undef PT_SETTINGS_COL_COUNT
+
+/*
  * Return a list of databases from the pg_database catalog
  */
 static List *
@@ -462,7 +629,7 @@ get_database_list(void)
     TableScanDesc scan;
     HeapTuple     tup;
     MemoryContext oldcxt;
-    ScanKeyData   key[1];
+    ScanKeyData   key;
 
     /* Start a transaction to access pg_database */
     StartTransactionCommand();
@@ -470,13 +637,13 @@ get_database_list(void)
     rel = relation_open(DatabaseRelationId, AccessShareLock);
 
     /* Ignore databases that we can't connect to */
-    ScanKeyInit(&key[0],
+    ScanKeyInit(&key,
                 Anum_pg_database_datallowconn,
                 BTEqualStrategyNumber,
                 F_BOOLEQ,
                 BoolGetDatum(true));
 
-    scan = table_beginscan_catalog(rel, 0, &key[0]);
+    scan = table_beginscan_catalog(rel, 1, &key);
 
     while (HeapTupleIsValid(tup = heap_getnext(scan, ForwardScanDirection)))
     {
@@ -564,200 +731,6 @@ get_extensions_list(PTDatabaseInfo *dbinfo, MemoryContext cxt)
 }
 
 /*
- * Init json state.
- */
-static bool
-json_state_init()
-{
-    json_blocks_started = 0;
-    json_arrays_started = 0;
-
-    return true;
-}
-
-/*
- * Do we have unclosed square or curley brackets? If so, then
- * the JSON in our case isn't really valid.
- */
-static bool
-json_state_validate()
-{
-    return (json_blocks_started == 0 && json_arrays_started == 0);
-}
-
-/*
- * Fixes a JSON string to avoid malformation of a json value.
- */
-static char *
-json_fix_value(char *str, int sz)
-{
-    int i;
-    char *s_copy = pstrdup(str);
-    char *s = s_copy;
-
-    for(i = 0; i < (sz - 1) && *s; i++)
-    {
-        if (*s == '"')
-        {
-            str[i++] = '\\';
-            str[i] = '"';
-
-            continue;
-        }
-
-        str[i] = *s;
-        s++;
-    }
-
-    /* Ensure that we always end up with a string value. */
-    str[i] = '\0';
-
-    pfree(s_copy);
-
-    return str;
-}
-
-/*
- * Construct a JSON block for writing.
- *
- * NOTE: We are not escape any quote characters in key or value strings, as
- * we don't expect to encounter that in extension names.
- */
-static char *
-construct_json_block(char *msg_block, size_t msg_block_sz, char *key, char *value, int flags)
-{
-    char msg[2048] = {0};
-    char msg_json[2048] = {0};
-
-    /* Make the string empty so that we can always concat. */
-    msg_block[0] = '\0';
-
-    if (flags & PT_JSON_BLOCK_START)
-    {
-        PT_FORMAT_JSON(msg_json, sizeof(msg_json), "{", ptss->json_file_indent);
-        strlcpy(msg_block, msg_json, msg_block_sz);
-
-        json_blocks_started++;
-        ptss->json_file_indent++;
-    }
-
-    if (flags & PT_JSON_BLOCK_KEY)
-    {
-        pg_snprintf(msg, sizeof(msg), "\"key\": \"%s\",", key);
-        PT_FORMAT_JSON(msg_json, sizeof(msg_json), msg, ptss->json_file_indent);
-        strlcat(msg_block, msg_json, msg_block_sz);
-    }
-
-    if (flags & PT_JSON_BLOCK_VALUE)
-    {
-        pg_snprintf(msg, sizeof(msg), "\"value\": \"%s\"", value);
-        PT_FORMAT_JSON(msg_json, sizeof(msg_json), msg, ptss->json_file_indent);
-        strlcat(msg_block, msg_json, msg_block_sz);
-    }
-
-    if (flags & PT_JSON_ARRAY_START)
-    {
-        pg_snprintf(msg, sizeof(msg), "\"value\": [");
-        PT_FORMAT_JSON(msg_json, sizeof(msg_json), msg, ptss->json_file_indent);
-        strlcat(msg_block, msg_json, msg_block_sz);
-
-        json_arrays_started++;
-        ptss->json_file_indent++;
-    }
-
-    /* Value is not an array so we can close the block. */
-    if (flags & PT_JSON_ARRAY_END)
-    {
-        ptss->json_file_indent--;
-
-        PT_FORMAT_JSON(msg_json, sizeof(msg_json), "]", ptss->json_file_indent);
-        strlcat(msg_block, msg_json, msg_block_sz);
-
-        json_arrays_started--;
-    }
-
-    /* Value is not an array so we can close the block. */
-    if (flags & PT_JSON_BLOCK_END)
-    {
-        char closing[3] = {'}', ',', '\0'};
-
-        if (flags & PT_JSON_BLOCK_LAST)
-        {
-            /* Let's remove the comma in case this is the last block. */
-            closing[1] = '\0';
-        }
-
-        ptss->json_file_indent--;
-
-        PT_FORMAT_JSON(msg_json, sizeof(msg_json), closing, ptss->json_file_indent);
-        strlcat(msg_block, msg_json, msg_block_sz);
-
-        json_blocks_started--;
-    }
-
-    return msg_block;
-}
-
-/*
- * Open a file in the given mode.
- */
-static FILE *
-json_file_open(char *pathname, char *mode)
-{
-    FILE *fp;
-    struct stat st;
-    bool is_dir = false;
-
-    /* Let's validate the path. */
-    if (stat(pg_telemetry_folder, &st) == 0)
-    {
-        is_dir = S_ISDIR(st.st_mode);
-    }
-
-    if (is_dir == false)
-    {
-        ereport(LOG,
-                (errcode_for_file_access(),
-                 errmsg("percont_telemetry.pg_telemetry_folder \"%s\" is not set to a writeable folder or the folder does not exist.", pathname)));
-        PT_WORKER_EXIT(PT_FILE_ERROR);
-    }
-
-    fp = fopen(pathname, mode);
-    if (fp == NULL)
-	{
-        ereport(LOG,
-                (errcode_for_file_access(),
-                 errmsg("Could not open file %s for writing.", pathname)));
-        PT_WORKER_EXIT(PT_FILE_ERROR);
-    }
-
-    return fp;
-}
-
-/*
- * Write JSON to file.
- */
-static void
-write_json_to_file(FILE *fp, char *json_str)
-{
-    int len;
-    int bytes_written;
-
-    len = strlen(json_str);
-    bytes_written = fwrite(json_str, 1, len, fp);
-
-    if (len != bytes_written)
-    {
-        ereport(LOG,
-                (errcode_for_file_access(),
-                 errmsg("Could not write to json file.")));
-
-        fclose(fp);
-        PT_WORKER_EXIT(PT_FILE_ERROR);
-    }
-}
-
-/*
  * Writes database information along with names of the active extensions to
  * the file.
  */
@@ -776,21 +749,29 @@ write_database_info(PTDatabaseInfo *dbinfo, List *extlist)
     /* Open file in append mode. */
     fp = json_file_open(ptss->dbtemp_filepath, "a+");
 
-    /* Initialize JSON state. */
-    json_state_init();
+    if (ptss->first_db_entry)
+    {
+        /* Construct and initiate the active extensions array block. */
+        construct_json_block(msg_json, sz_json, "", "databases", PT_JSON_ARRAY_START, &ptss->json_file_indent);
+        write_json_to_file(fp, msg_json);
+    }
+
+    /* Construct and initiate the active extensions array block. */
+    construct_json_block(msg_json, sz_json, "database", "value", PT_JSON_BLOCK_ARRAY_VALUE, &ptss->json_file_indent);
+    write_json_to_file(fp, msg_json);
 
     /* Construct and write the database OID block. */
     pg_snprintf(msg, sizeof(msg), "%u", dbinfo->datid);
-    construct_json_block(msg_json, sz_json, "database_oid", msg, PT_JSON_BLOCK_SIMPLE);
+    construct_json_block(msg_json, sz_json, "database_oid", msg, PT_JSON_BLOCK_SIMPLE, &ptss->json_file_indent);
     write_json_to_file(fp, msg_json);
 
     /* Construct and write the database size block. */
     pg_snprintf(msg, sizeof(msg), "%lu", dbinfo->datsize);
-    construct_json_block(msg_json, sz_json, "database_size", msg, PT_JSON_BLOCK_SIMPLE);
+    construct_json_block(msg_json, sz_json, "database_size", msg, PT_JSON_BLOCK_SIMPLE, &ptss->json_file_indent);
     write_json_to_file(fp, msg_json);
 
     /* Construct and initiate the active extensions array block. */
-    construct_json_block(msg_json, sz_json, "active_extensions", "", PT_JSON_BLOCK_ARRAY_VALUE);
+    construct_json_block(msg_json, sz_json, "active_extensions", "value", PT_JSON_BLOCK_ARRAY_VALUE, &ptss->json_file_indent);
     write_json_to_file(fp, msg_json);
 
     /* Iterate through all extensions and those to the array. */
@@ -800,39 +781,45 @@ write_database_info(PTDatabaseInfo *dbinfo, List *extlist)
 
         flags = (list_tail(extlist) == lc) ? (PT_JSON_BLOCK_SIMPLE | PT_JSON_BLOCK_LAST) : PT_JSON_BLOCK_SIMPLE;
 
-        construct_json_block(msg_json, sz_json, "extension_name", extinfo->extname, flags);
+        construct_json_block(msg_json, sz_json, "extension_name", extinfo->extname, flags, &ptss->json_file_indent);
         write_json_to_file(fp, msg_json);
     }
 
+    /* Close the array and block and write to file */
+    construct_json_block(msg, sizeof(msg), "active_extensions", "", PT_JSON_ARRAY_END | PT_JSON_BLOCK_END | PT_JSON_BLOCK_LAST, &ptss->json_file_indent);
+    strcpy(msg_json, msg);
+    write_json_to_file(fp, msg_json);
+
     /* Close the array */
-    construct_json_block(msg, sizeof(msg), "active_extensions", "", PT_JSON_ARRAY_END);
+    construct_json_block(msg, sizeof(msg), "database", "", PT_JSON_ARRAY_END | PT_JSON_BLOCK_LAST, &ptss->json_file_indent);
     strcpy(msg_json, msg);
 
-    /* Close the extension block */
+    /* Close the database block */
     flags = (ptss->last_db_entry) ? (PT_JSON_BLOCK_END | PT_JSON_BLOCK_LAST) : PT_JSON_BLOCK_END;
-    construct_json_block(msg, sizeof(msg), "active_extensions", "", flags);
+    construct_json_block(msg, sizeof(msg), "database", "", flags, &ptss->json_file_indent);
     strlcat(msg_json, msg, sz_json);
 
     /* Write both to file. */
     write_json_to_file(fp, msg_json);
 
+    if (ptss->last_db_entry)
+    {
+        /* Close the array */
+        construct_json_block(msg, sizeof(msg), "databases", "", PT_JSON_ARRAY_END | PT_JSON_BLOCK_LAST, &ptss->json_file_indent);
+        strcpy(msg_json, msg);
+
+        /* Write both to file. */
+        write_json_to_file(fp, msg_json);
+    }
+
     /* Clean up */
     fclose(fp);
-
-    /* Validate JSON state. */
-    if (json_state_validate() == false)
-    {
-        ereport(LOG,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("percona_telemetry: malformed json created.")));
-        PT_WORKER_EXIT(PT_JSON_ERROR);
-    }
 
     return true;
 }
 
 /*
- * Main function for the background leader process
+ * Main function for the background launcher process
  */
 void
 percona_telemetry_main(Datum main_arg)
@@ -848,8 +835,7 @@ percona_telemetry_main(Datum main_arg)
     bool first_time = true;
 
     /* Save the version in a JSON escaped stirng just to be safe. */
-    strcpy(json_pg_version, PG_VERSION_STR);
-    json_fix_value(json_pg_version, sizeof(json_pg_version));
+    strcpy(json_pg_version, PG_VERSION);
 
     /* Setup signal callbacks */
     pqsignal(SIGTERM, pt_sigterm);
@@ -875,7 +861,7 @@ percona_telemetry_main(Datum main_arg)
     pt_cxt = AllocSetContextCreate(TopMemoryContext, "Percona Telemetry Context", ALLOCSET_DEFAULT_SIZES);
 
     /* Should never really terminate unless... */
-    while (telemetry_enabled && !sigterm_recvd && ptss->error_code == PT_SUCCESS)
+    while (!sigterm_recvd && ptss->error_code == PT_SUCCESS)
 	{
         /* Don't sleep the first time */
         if (first_time == false)
@@ -896,6 +882,10 @@ percona_telemetry_main(Datum main_arg)
             ProcessConfigFile(PGC_SIGHUP);
         }
 
+        /* Don't do any processing but keep the launcher alive */
+        if (telemetry_enabled == false)
+            continue;
+
         /* Time to end the loop as the server is shutting down */
 		if ((rc & WL_POSTMASTER_DEATH) || ptss->error_code != PT_SUCCESS)
 			break;
@@ -907,6 +897,8 @@ percona_telemetry_main(Datum main_arg)
         /* We are not processing a cell at the moment. So, let's get the updated database list. */
         if (dblist == NIL && (rc & WL_TIMEOUT || first_time))
         {
+            char temp_buff[100];
+
             /* Data collection will start now */
             first_time = false;
 
@@ -924,19 +916,35 @@ percona_telemetry_main(Datum main_arg)
 
             /* Construct and write the database size block. */
             pg_snprintf(msg, sizeof(msg), "%lu", GetSystemIdentifier());
-            construct_json_block(msg_json, sz_json, "instanceId", msg, PT_JSON_BLOCK_SIMPLE);
+            construct_json_block(msg_json, sz_json, "db_instance_id", msg, PT_JSON_KEY_VALUE_PAIR, &ptss->json_file_indent);
             write_json_to_file(fp, msg_json);
 
             /* Construct and initiate the active extensions array block. */
-            construct_json_block(msg_json, sz_json, "pillar_version", json_pg_version, PT_JSON_BLOCK_SIMPLE);
+            construct_json_block(msg_json, sz_json, "pillar_version", json_pg_version, PT_JSON_KEY_VALUE_PAIR, &ptss->json_file_indent);
             write_json_to_file(fp, msg_json);
 
             /* Construct and initiate the active extensions array block. */
-            construct_json_block(msg_json, sz_json, "databases", "", PT_JSON_BLOCK_ARRAY_VALUE);
+            construct_json_block(msg_json, sz_json, "uptime", server_uptime(), PT_JSON_KEY_VALUE_PAIR, &ptss->json_file_indent);
+            write_json_to_file(fp, msg_json);
+
+            /* Construct and initiate the active extensions array block. */
+            pg_snprintf(temp_buff, sizeof(temp_buff), "%d", list_length(dblist));
+            construct_json_block(msg_json, sz_json, "databases_count", temp_buff, PT_JSON_KEY_VALUE_PAIR, &ptss->json_file_indent);
             write_json_to_file(fp, msg_json);
 
             /* Let's close the file now so that processes may add their stuff. */
             fclose(fp);
+
+            /* Validate JSON state. */
+            if (json_state_validate() == false)
+            {
+                ereport(LOG,
+                        (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                            errmsg("percona_telemetry: malformed json created.")));
+
+                ptss->error_code = PT_FILE_ERROR;
+                break;
+            }
 
             ptss->last_file_processed = GetCurrentTimestamp();
         }
@@ -954,6 +962,8 @@ percona_telemetry_main(Datum main_arg)
             lc = (lc) ? lnext(lc) : list_head(dblist);
 #endif
 
+            ptss->first_db_entry = (lc == list_head(dblist));
+
             /*
              * We've reached end of the list. So, let's cleanup and go to
              * sleep until the timer runs out. Also, we need to move the
@@ -966,34 +976,6 @@ percona_telemetry_main(Datum main_arg)
 
                 /* We should always have write_in_progress true here. */
                 Assert(ptss->write_in_progress == true);
-
-                /* Close the open the file, close tags and close the file. */
-                fp = json_file_open(ptss->dbtemp_filepath, "a+");
-
-                /* Close the array */
-                construct_json_block(msg, sizeof(msg), "databases", "", PT_JSON_ARRAY_END);
-                strcpy(msg_json, msg);
-
-                /* Close the extension block */
-                construct_json_block(msg, sizeof(msg), "databases", "", PT_JSON_BLOCK_END | PT_JSON_BLOCK_LAST);
-                strlcat(msg_json, msg, sz_json);
-
-                /* Write both to file. */
-                write_json_to_file(fp, msg_json);
-
-                /* Clean up */
-                fclose(fp);
-
-                /* Validate JSON state. */
-                if (json_state_validate() == false)
-                {
-                    ereport(LOG,
-                            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                             errmsg("percona_telemetry: malformed json created.")));
-
-                    ptss->error_code = PT_FILE_ERROR;
-                    break;
-                }
 
 	            /* Let's rename the temp file so that agent can pick it up. */
 	            if (rename(ptss->dbtemp_filepath, ptss->dbinfo_filepath) < 0)
@@ -1018,7 +1000,7 @@ percona_telemetry_main(Datum main_arg)
 
             /*
              * Run the dynamic background worker and wait for it's completion
-             * so that we can wake up the leader process.
+             * so that we can wake up the launcher process.
              */
         	status = setup_background_worker("percona_telemetry_worker",
                                                 "percona_telemetry worker",
@@ -1065,6 +1047,10 @@ percona_telemetry_worker(Datum main_arg)
 
     /* Set name to make percona_telemetry visible in pg_stat_activity */
     pgstat_report_appname("percona_telemetry_worker");
+
+    /* Get the settings */
+    if (ptss->first_db_entry)
+        write_pg_settings();
 
     extlist = get_extensions_list(&ptss->dbinfo, tmpcxt);
 

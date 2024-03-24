@@ -21,6 +21,8 @@ BEGIN
     SELECT REPLACE(file_content, pg_version, '<PG VERSION>') INTO file_content;
 
     -- If we have more than 6 consecutive digits, it's file size unlike to be an OID
+    SELECT regexp_replace(file_content, '\d{2}:\d{2}:\d{2}.\d{6}', '<SERVER UPTIME>', 'g') INTO file_content;
+    SELECT regexp_replace(file_content, '\d{2}\.\d{1,2}', '<PG VERSION>', 'g') INTO file_content;
     SELECT regexp_replace(file_content, '\d{6,}', '<DB SIZE>', 'g') INTO file_content;
     SELECT regexp_replace(file_content, '\d{1,}', '<DB OID>', 'g') INTO file_content;
 

@@ -3,6 +3,7 @@
 MODULE_big = percona_telemetry
 OBJS = \
 	$(WIN32RES) \
+	pt_json.o	\
 	percona_telemetry.o
 
 EXTENSION = percona_telemetry
