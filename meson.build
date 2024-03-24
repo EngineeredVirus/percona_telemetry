@@ -1,4 +1,5 @@
 percona_telemetry_sources = files(
+  'pt_json.c',
   'percona_telemetry.c',
 )
 
