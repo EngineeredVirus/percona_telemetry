@@ -2,6 +2,13 @@
 -- basic sanity
 --
 CREATE EXTENSION percona_telemetry;
+-- Sleep so that waiting on agent becomes true
+SELECT pg_sleep(3);
+ pg_sleep 
+----------
+ 
+(1 row)
+
 SELECT name FROM pg_settings WHERE name LIKE 'percona_telemetry.%';
                  name                  
 ---------------------------------------
@@ -21,7 +28,7 @@ SELECT regexp_replace(output_file_name, '\d{6,}', '<INSTANCE ID>', 'g') AS outpu
         waiting_on_agent FROM percona_telemetry_status();
             output_file_name            | last_file_processed | waiting_on_agent 
 ----------------------------------------+---------------------+------------------
- ./percona_telemetry-<INSTANCE ID>.json | t                   | f
+ ./percona_telemetry-<INSTANCE ID>.json | t                   | t
 (1 row)
 
 DROP EXTENSION percona_telemetry;

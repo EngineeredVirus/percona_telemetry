@@ -4,6 +4,9 @@
 
 CREATE EXTENSION percona_telemetry;
 
+-- Sleep so that waiting on agent becomes true
+SELECT pg_sleep(3);
+
 SELECT name FROM pg_settings WHERE name LIKE 'percona_telemetry.%';
 SELECT percona_telemetry_version();
 SELECT regexp_replace(output_file_name, '\d{6,}', '<INSTANCE ID>', 'g') AS output_file_name,
