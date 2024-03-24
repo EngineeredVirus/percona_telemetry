@@ -20,6 +20,9 @@ BEGIN
     SELECT REPLACE(file_content, pg_version, '<PG VERSION>') INTO file_content;
 
     -- If we have more than 6 consecutive digits, it's file size unlike to be an OID
+    SELECT regexp_replace(file_content, 'archive_cleanup_command.*', 'archive_cleanup_command', 'g') INTO file_content;
+    SELECT regexp_replace(file_content, '\d{2}:\d{2}:\d{2}.\d{6}', '<SERVER UPTIME>', 'g') INTO file_content;
+    SELECT regexp_replace(file_content, '\d{2}\.\d{1,2}', '<PG VERSION>', 'g') INTO file_content;
     SELECT regexp_replace(file_content, '\d{6,}', '<DB SIZE>', 'g') INTO file_content;
     SELECT regexp_replace(file_content, '\d{1,}', '<DB OID>', 'g') INTO file_content;
 
@@ -36,73 +39,94 @@ SELECT pg_sleep(3);
 
 CREATE EXTENSION percona_telemetry;
 SELECT read_json_file();
-                read_json_file                
-----------------------------------------------
-           {                                 +
-             "key": "instanceId",            +
-             "value": "<SYSTEM IDENTIFIER>"  +
-           },                                +
-           {                                 +
-             "key": "pillar_version",        +
-             "value": "<PG VERSION>"         +
-           },                                +
-           {                                 +
-             "key": "databases",             +
-             "value": [                      +
-               {                             +
-                 "key": "database_oid",      +
-                 "value": "<DB OID>"         +
-               },                            +
-               {                             +
-                 "key": "database_size",     +
-                 "value": "<DB SIZE>"        +
-               },                            +
-               {                             +
-                 "key": "active_extensions", +
-                 "value": [                  +
-                   {                         +
-                     "key": "extension_name",+
-                     "value": "plpgsql"      +
-                   }                         +
-                 ]                           +
-               },                            +
-               {                             +
-                 "key": "database_oid",      +
-                 "value": "<DB OID>"         +
-               },                            +
-               {                             +
-                 "key": "database_size",     +
-                 "value": "<DB SIZE>"        +
-               },                            +
-               {                             +
-                 "key": "active_extensions", +
-                 "value": [                  +
-                   {                         +
-                     "key": "extension_name",+
-                     "value": "plpgsql"      +
-                   }                         +
-                 ]                           +
-               },                            +
-               {                             +
-                 "key": "database_oid",      +
-                 "value": "<DB OID>"         +
-               },                            +
-               {                             +
-                 "key": "database_size",     +
-                 "value": "<DB SIZE>"        +
-               },                            +
-               {                             +
-                 "key": "active_extensions", +
-                 "value": [                  +
-                   {                         +
-                     "key": "extension_name",+
-                     "value": "plpgsql"      +
-                   }                         +
-                 ]                           +
-               }                             +
-             ]                               +
-           }                                 +
- 
+                     read_json_file                      
+---------------------------------------------------------
+           "db_instance_id": "<SYSTEM IDENTIFIER>",     +
+           "pillar_version": "<PG VERSION>",            +
+           "uptime": "<SERVER UPTIME>",                 +
+           "databases_count": "<DB OID>",               +
+           "settings": [                                +
+             {                                          +
+               "key": "setting",                        +
+               "value": [                               +
+                 {                                      +
+                   "key": "name",                       +
+                   "value": "allow_in_place_tablespaces"+
+                 },                                     +
+                 {                                      +
+                   "key": "unit",                       +
+                   "value": "NULL"                      +
+                 },                                     +
+                 {                                      +
+                   "key": "setting",                    +
+                   "value": "off"                       +
+                 },                                     +
+                 {                                      +
+                   "key": "reset_val",                  +
+                   "value": "off"                       +
+                 },                                     +
+                 {                                      +
+                   "key": "boot_val",                   +
+                   "value": "off"                       +
+                 }                                      +
+               ]                                        +
+             },                                         +
+             {                                          +
+               "key": "setting",                        +
+               "value": [                               +
+                 {                                      +
+                   "key": "name",                       +
+                   "value": "allow_system_table_mods"   +
+                 },                                     +
+                 {                                      +
+                   "key": "unit",                       +
+                   "value": "NULL"                      +
+                 },                                     +
+                 {                                      +
+                   "key": "setting",                    +
+                   "value": "off"                       +
+                 },                                     +
+                 {                                      +
+                   "key": "reset_val",                  +
+                   "value": "off"                       +
+                 },                                     +
+                 {                                      +
+                   "key": "boot_val",                   +
+                   "value": "off"                       +
+                 }                                      +
+               ]                                        +
+             },                                         +
+             {                                          +
+               "key": "setting",                        +
+               "value": [                               +
+                 {                                      +
+                   "key": "name",                       +
+                   "value": "application_name"          +
+                 },                                     +
+                 {                                      +
+                   "key": "unit",                       +
+                   "value": "NULL"                      +
+                 },                                     +
+                 {                                      +
+                   "key": "setting",                    +
+                   "value": "NULL"                      +
+                 },                                     +
+                 {                                      +
+                   "key": "reset_val",                  +
+                   "value": "NULL"                      +
+                 },                                     +
+                 {                                      +
+                   "key": "boot_val",                   +
+                   "value": "NULL"                      +
+                 }                                      +
+               ]                                        +
+             },                                         +
+             {                                          +
+               "key": "setting",                        +
+               "value": [                               +
+                 {                                      +
+                   "key": "name",                       +
+                   "value": "archive_cleanup_command
 (1 row)
 
 DROP EXTENSION percona_telemetry;
