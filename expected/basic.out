@@ -6,7 +6,7 @@ SELECT name FROM pg_settings WHERE name LIKE 'percona_telemetry.%';
                  name                  
 ---------------------------------------
  percona_telemetry.enabled
- percona_telemetry.pt_telemetry_folder
+ percona_telemetry.pg_telemetry_folder
  percona_telemetry.scrape_interval
 (3 rows)
 

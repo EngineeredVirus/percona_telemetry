@@ -89,7 +89,7 @@ static PTSharedState *ptss = NULL;
 static volatile sig_atomic_t sigterm_recvd = false;
 
 /* GUC variables */
-char *pt_telemetry_folder = NULL;
+char *pg_telemetry_folder = NULL;
 int scrape_interval = HOURS_PER_DAY * MINS_PER_HOUR * SECS_PER_MINUTE;
 bool telemetry_enabled = true;
 
@@ -172,7 +172,7 @@ static void
 cleaup_telemetry_dir()
 {
     // DIR *d;
-    // d = AllocateDir(pt_telemetry_folder);
+    // d = AllocateDir(pg_telemetry_folder);
     // struct dirent *de;
     // uint64 system_id = GetSystemIdentifier();
     // char json_file_id[MAXPGPATH];
@@ -185,7 +185,7 @@ cleaup_telemetry_dir()
     //                     (errcode_for_file_access(),
     //                         errmsg("could not open percona telemetry directory \"%s\": %m",
     //                                     pt_)));
-    //     *err_msg = psprintf("could not open directory \"%s\"", pt_telemetry_folder);
+    //     *err_msg = psprintf("could not open directory \"%s\"", pg_telemetry_folder);
     // }
 
     // pg_snprintf(json_file_id, sizeof(json_file_id), "-%lu.json", system_id);
@@ -194,7 +194,7 @@ cleaup_telemetry_dir()
     // file_id_len = strlen(json_file_id);
     // Assert(file_id_len == strlen(temp_file_id));
 
-    // while (de = ReadDir(d, pt_telemetry_folder))
+    // while (de = ReadDir(d, pg_telemetry_folder))
     // {
     //     PGFileType t;
     //     char filename[MAXPGPATH];
@@ -214,7 +214,7 @@ cleaup_telemetry_dir()
     // }
 }
 
-//pt_telemetry_folder
+//pg_telemetry_folder
 bool
 is_valid_dir(char *folder_path)
 {
@@ -231,7 +231,7 @@ is_valid_dir(char *folder_path)
     {
         ereport(LOG,
                 (errcode_for_file_access(),
-                 errmsg("percont_telemetry.pt_telemetry_folder \"%s\" is not set to a writeable folder or the folder does not exist.", folder_path)));
+                 errmsg("percont_telemetry.pg_telemetry_folder \"%s\" is not set to a writeable folder or the folder does not exist.", folder_path)));
         PT_WORKER_EXIT(PT_FILE_ERROR);
     }
 }
@@ -320,8 +320,8 @@ pt_shmem_init(void)
         uint64 system_id = GetSystemIdentifier();
 
         /* Set paths */
-        pg_snprintf(ptss->dbtemp_filepath, sizeof(ptss->dbtemp_filepath), "%s/%s-%lu.temp", pt_telemetry_folder, PT_FILENAME_BASE, system_id);
-        pg_snprintf(ptss->dbinfo_filepath, sizeof(ptss->dbinfo_filepath), "%s/%s-%lu.json", pt_telemetry_folder, PT_FILENAME_BASE, system_id);
+        pg_snprintf(ptss->dbtemp_filepath, sizeof(ptss->dbtemp_filepath), "%s/%s-%lu.temp", pg_telemetry_folder, PT_FILENAME_BASE, system_id);
+        pg_snprintf(ptss->dbinfo_filepath, sizeof(ptss->dbinfo_filepath), "%s/%s-%lu.json", pg_telemetry_folder, PT_FILENAME_BASE, system_id);
 
         /* Let's be optimistic here. No error code and no file currently being written. */
         ptss->error_code = PT_SUCCESS;
@@ -343,10 +343,10 @@ static void
 init_guc(void)
 {
     /* file path */
-    DefineCustomStringVariable("percona_telemetry.pt_telemetry_folder",
+    DefineCustomStringVariable("percona_telemetry.pg_telemetry_folder",
                                "Directory path for writing database info file(s)",
                                NULL,
-                               &pt_telemetry_folder,
+                               &pg_telemetry_folder,
                                "/usr/local/percona/telemetry/pg",
                                PGC_SIGHUP,
                                0,
