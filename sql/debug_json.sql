@@ -36,7 +36,7 @@ WHERE   '"' || current_setting('server_version') || '"' = (SELECT CAST(read_json
 
 SELECT  'matches' AS settings
 FROM    pg_settings
-WHERE   name NOT LIKE 'plpgsql.%'
+WHERE   name NOT LIKE 'plpgsql.%' AND vartype != 'string'
 HAVING  COUNT(*) = (SELECT json_array_length(read_json_file()::JSON->'settings'));
 
 SELECT  'matches' AS databases_count

@@ -521,7 +521,7 @@ write_pg_settings(void)
 {
     SPITupleTable *tuptable;
     int spi_result;
-    char *query = "SELECT name, unit, setting, reset_val, boot_val FROM pg_settings";
+    char *query = "SELECT name, unit, setting, reset_val, boot_val FROM pg_settings where vartype != 'string'";
     char msg[2048] = {0};
     char msg_json[4096] = {0};
     size_t sz_json;
