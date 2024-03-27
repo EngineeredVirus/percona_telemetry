@@ -73,7 +73,7 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 /* Helper functions */
 static BgwHandleStatus setup_background_worker(const char *bgw_function_name, const char *bgw_name, const char *bgw_type, Oid datid, pid_t bgw_notify_pid);
 static void start_leader(void);
-static char *server_uptime(void);
+static long server_uptime(void);
 static void cleaup_telemetry_dir(void);
 static char *generate_filename(char *filename);
 static bool validate_dir(char *folder_path);
@@ -496,24 +496,17 @@ setup_background_worker(const char *bgw_function_name, const char *bgw_name, con
 }
 
 /*
- * Returns string contain server uptime in interval representation
- * hh:mm:ss.mmmmmm => Hours : Minutes : Seconds . Microseconds
+ * Returns string contain server uptime in seconds
  */
-static char *
+static long
 server_uptime(void)
 {
-    TimestampTz start_time;
-    TimestampTz current_time;
-    Interval *uptime;
+    long secs;
+    int microsecs;
 
-    /* Calculate uptime */
-    start_time = PgStartTime;
-    current_time = GetCurrentTimestamp();
+    TimestampDifference(PgStartTime, GetCurrentTimestamp(), &secs, &microsecs);
 
-    uptime = DatumGetIntervalP(DirectFunctionCall2(timestamp_mi, TimestampTzGetDatum(current_time), TimestampTzGetDatum(start_time)));
-
-    /* Return uptime as a string */
-    return DatumGetCString(DirectFunctionCall1(interval_out, PointerGetDatum(uptime)));
+    return secs;
 }
 
 /*
@@ -941,7 +934,8 @@ percona_telemetry_main(Datum main_arg)
             write_json_to_file(fp, msg_json);
 
             /* Construct and initiate the active extensions array block. */
-            construct_json_block(msg_json, sz_json, "uptime", server_uptime(), PT_JSON_KEY_VALUE_PAIR, &ptss->json_file_indent);
+            pg_snprintf(msg, sizeof(msg), "%ld", server_uptime());
+            construct_json_block(msg_json, sz_json, "uptime", msg, PT_JSON_KEY_VALUE_PAIR, &ptss->json_file_indent);
             write_json_to_file(fp, msg_json);
 
             /* Construct and initiate the active extensions array block. */
