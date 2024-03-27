@@ -14,11 +14,17 @@ You can find the configuration parameters of the `percona_telemetry` extension i
 
 #### Parameters
 
-1. `percona_telemetry.pg_telemetry_folder`
+1. `percona_telemetry.enabled`
+
+  * Default: true
+  * Unit: boolean
+  * When set to `false`, the leader process terminates when the configuration is read.
+
+2. `percona_telemetry.pg_telemetry_folder`
 
   * Default: /usr/local/percona/telemetry/pg
 
-2. `percona_telemetry.scrape_interval`
+3. `percona_telemetry.scrape_interval`
 
   * Default: 86,400 (24 hours)
   * Unit: s
@@ -26,11 +32,13 @@ You can find the configuration parameters of the `percona_telemetry` extension i
     may be woken up by a configuration reload interrupt or when the shutdown process is
     initiated.
 
-3. `percona_telemetry.enabled`
+4. `percona_telemetry.files_to_keep`
 
   * Default: true
   * Unit: boolean
   * When set to `false`, the leader process terminates when the configuration is read.
+
+> **NOTE** GUCs 2 - 4 are only visible if environment variable PT_DEBUG is set. This is prevent users in production environment to change these variables which are only for testing purposes.
 
 #### Functions
 
@@ -40,12 +48,10 @@ You can find the configuration parameters of the `percona_telemetry` extension i
 
 2. `percona_telemetry_status`
 
-  * OUT: output_file_name       - TEXT
+  * OUT: latest_output_filename   - TEXT
     - Path of the JSON output file.
-  * OUT: last_file_processed    - Timestamp with Timezone
-    - The timestamp with timezone when the last JSON file was written.
-  * OUT: waiting_on_agent       - BOOLEAN
-    - True if the last generated file was not removed by the Telemetery Agent.
+  * OUT: pt_enabled               - BOOLEAN
+    - True if telemetry data collection is enabled.
 
 ### Setup
 
