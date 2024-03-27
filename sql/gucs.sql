@@ -16,7 +16,6 @@ ORDER BY name;
 \x
 
 ALTER SYSTEM SET percona_telemetry.enabled = false;
-ALTER SYSTEM SET percona_telemetry.scrape_interval = '1s';
 SELECT pg_reload_conf();
 
 SELECT pg_sleep(2);
@@ -25,7 +24,6 @@ FROM pg_stat_activity
 WHERE application_name = 'percona_telemetry';
 
 ALTER SYSTEM RESET percona_telemetry.enabled;
-ALTER SYSTEM RESET percona_telemetry.scrape_interval;
 SELECT pg_reload_conf();
 
 DROP EXTENSION percona_telemetry;

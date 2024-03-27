@@ -73,8 +73,10 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 /* Helper functions */
 static BgwHandleStatus setup_background_worker(const char *bgw_function_name, const char *bgw_name, const char *bgw_type, Oid datid, pid_t bgw_notify_pid);
 static void start_leader(void);
-static bool last_file_exists(void);
 static char *server_uptime(void);
+static void cleaup_telemetry_dir(void);
+static char *generate_filename(char *filename);
+static bool validate_dir(char *folder_path);
 
 /* Database information collection and writing to file */
 static void write_pg_settings(void);
@@ -85,13 +87,19 @@ static bool write_database_info(PTDatabaseInfo *dbinfo, List *extlist);
 /* Shared state stuff */
 static PTSharedState *ptss = NULL;
 
+#define PT_SHARED_STATE_HEADER_SIZE     (offsetof(PTSharedState, telemetry_filenames))
+#define PT_SHARED_STATE_PREV_FILE_SIZE  (files_to_keep * MAXPGPATH)
+#define PT_SHARED_STATE_SIZE            (PT_SHARED_STATE_HEADER_SIZE + PT_SHARED_STATE_PREV_FILE_SIZE)
+#define PT_DEFAULT_FOLDER_PATH          "/usr/local/percona/telemetry/pg"
+
 /* variable for signal handlers' variables */
 static volatile sig_atomic_t sigterm_recvd = false;
 
 /* GUC variables */
-char *pg_telemetry_folder = NULL;
+char *t_folder = PT_DEFAULT_FOLDER_PATH;
 int scrape_interval = HOURS_PER_DAY * MINS_PER_HOUR * SECS_PER_MINUTE;
 bool telemetry_enabled = true;
+int files_to_keep = 7;
 
 /* General global variables */
 static MemoryContext pt_cxt;
@@ -130,9 +138,6 @@ _PG_init(void)
 #endif
 
 	start_leader();
-
-    // TimestampTz t = GetCurrentTimestamp();
-    // ereport(LOG, (errmsg("GetCurrentTimestamp() => %ld", (int64)GetCurrentTimestamp())));
 }
 
 /*
@@ -150,17 +155,14 @@ start_leader(void)
 static char *
 generate_filename(char *filename)
 {
-// 	struct timeval tp;
-// 	char		templ[128];
-// 	char		buf[128];
-// 	pg_time_t	tt;
+    char f_name[MAXPGPATH];
+    uint64 system_id = GetSystemIdentifier();
+    time_t currentTime;
 
-// GetCurrentTimestamp();
+    time(&currentTime);
+    pg_snprintf(f_name, MAXPGPATH, "%s-%lu-%ld.json", PT_FILENAME_BASE, system_id, currentTime);
 
-// 	gettimeofday(&tp, NULL);
-// 	tt = (pg_time_t) tp.tv_sec;
-// 	pg_strftime(templ, sizeof(templ), "+%s", pg_localtime(&tt, session_timezone));
-// 	snprintf(buf, sizeof(buf), templ, tp.tv_usec);
+    join_path_components(filename, ptss->pg_telemetry_folder, f_name);
 
     return filename;
 }
@@ -168,55 +170,96 @@ generate_filename(char *filename)
 /*
  *
  */
-static void
-cleaup_telemetry_dir()
+static char *
+telemetry_add_filename(char *filename)
 {
-    // DIR *d;
-    // d = AllocateDir(pg_telemetry_folder);
-    // struct dirent *de;
-    // uint64 system_id = GetSystemIdentifier();
-    // char json_file_id[MAXPGPATH];
-    // char temp_file_id[MAXPGPATH];
-    // int file_id_len;
+    Assert(filename);
 
-    // if (d == NULL)
-    // {
-    //     ereport(elevel,
-    //                     (errcode_for_file_access(),
-    //                         errmsg("could not open percona telemetry directory \"%s\": %m",
-    //                                     pt_)));
-    //     *err_msg = psprintf("could not open directory \"%s\"", pg_telemetry_folder);
-    // }
-
-    // pg_snprintf(json_file_id, sizeof(json_file_id), "-%lu.json", system_id);
-    // pg_snprintf(temp_file_id, sizeof(temp_file_id), "-%lu.temp", system_id);
-
-    // file_id_len = strlen(json_file_id);
-    // Assert(file_id_len == strlen(temp_file_id));
-
-    // while (de = ReadDir(d, pg_telemetry_folder))
-    // {
-    //     PGFileType t;
-    //     char filename[MAXPGPATH];
-
-    //     /* Ignore . and .. */
-    //     if (d_namlen <= json_id_len)
-    //         continue;
-
-    //     if (strcmp(de->d_name + de->d_namlen - file_id_len, json_file_id) == 0)
-    //     {
-
-    //     }
-    //     else if (strcmp(de->d_name + de->d_namlen - file_id_len, temp_file_id) == 0)
-    //     {
-
-    //     }
-    // }
+    snprintf(ptss->telemetry_filenames[ptss->curr_file_index], MAXPGPATH, "%s", filename);
+    return ptss->telemetry_filenames[ptss->curr_file_index];
 }
 
-//pg_telemetry_folder
+/*
+ *
+ */
+static char *
+telemetry_curr_filename(void)
+{
+    return ptss->telemetry_filenames[ptss->curr_file_index];
+}
+
+/*
+ *
+ */
+static bool
+telemetry_file_is_valid(void)
+{
+    return (*ptss->telemetry_filenames[ptss->curr_file_index] != '\0');
+}
+
+/*
+ *
+ */
+static char *
+telemetry_file_next(char *filename)
+{
+    char *curr_oldest = telemetry_curr_filename();
+    ptss->curr_file_index = (ptss->curr_file_index + 1) % files_to_keep;
+
+    /* Remove the existing file on this location if valid */
+    if (telemetry_file_is_valid())
+    {
+        PathNameDeleteTemporaryFile(ptss->telemetry_filenames[ptss->curr_file_index], false);
+    }
+
+    telemetry_add_filename(filename);
+
+    return (*curr_oldest) ? curr_oldest : NULL;
+}
+
+/*
+ *
+ */
+static void
+cleaup_telemetry_dir(void)
+{
+    DIR *d;
+    struct dirent *de;
+    uint64 system_id = GetSystemIdentifier();
+    char json_file_id[MAXPGPATH];
+    int file_id_len;
+
+    validate_dir(ptss->pg_telemetry_folder);
+
+    d = AllocateDir(ptss->pg_telemetry_folder);
+
+    if (d == NULL)
+    {
+        ereport(ERROR,
+                        (errcode_for_file_access(),
+                            errmsg("could not open percona telemetry directory \"%s\": %m",
+                                        ptss->pg_telemetry_folder)));
+    }
+
+    pg_snprintf(json_file_id, sizeof(json_file_id), "%s-%lu", PT_FILENAME_BASE, system_id);
+    file_id_len = strlen(json_file_id);
+
+    while ((de = ReadDir(d, ptss->pg_telemetry_folder)) != NULL)
+    {
+        if (strncmp(json_file_id, de->d_name, file_id_len) == 0)
+        {
+            telemetry_file_next(de->d_name);
+        }
+    }
+
+    FreeDir(d);
+}
+
+/*
+ * pg_telemetry_folder
+ */
 bool
-is_valid_dir(char *folder_path)
+validate_dir(char *folder_path)
 {
     struct stat st;
     bool is_dir = false;
@@ -232,8 +275,11 @@ is_valid_dir(char *folder_path)
         ereport(LOG,
                 (errcode_for_file_access(),
                  errmsg("percont_telemetry.pg_telemetry_folder \"%s\" is not set to a writeable folder or the folder does not exist.", folder_path)));
+
         PT_WORKER_EXIT(PT_FILE_ERROR);
     }
+
+    return is_dir;
 }
 
 /*
@@ -242,7 +288,7 @@ is_valid_dir(char *folder_path)
 Datum
 percona_telemetry_status(PG_FUNCTION_ARGS)
 {
-#define PT_STATUS_COLUMN_COUNT  3
+#define PT_STATUS_COLUMN_COUNT  2
 
     TupleDesc tupdesc;
     Datum values[PT_STATUS_COLUMN_COUNT];
@@ -255,25 +301,18 @@ percona_telemetry_status(PG_FUNCTION_ARGS)
     pt_shmem_init();
 
     tupdesc = CreateTemplateTupleDesc(PT_STATUS_COLUMN_COUNT);
-    TupleDescInitEntry(tupdesc, (AttrNumber) 1, "output_file_name", TEXTOID, -1, 0);
-    TupleDescInitEntry(tupdesc, (AttrNumber) 2, "last_file_processed", TIMESTAMPTZOID, -1, 0);
-    TupleDescInitEntry(tupdesc, (AttrNumber) 3, "waiting_on_agent", BOOLOID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber) 1, "latest_output_filename", TEXTOID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber) 2, "pt_enabled", BOOLOID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
 
     col_index = 0;
-    if (ptss->dbinfo_filepath[0] != '\0')
-        values[col_index] = CStringGetTextDatum(ptss->dbinfo_filepath);
+    if (telemetry_curr_filename()[0] != '\0')
+        values[col_index] = CStringGetTextDatum(telemetry_curr_filename());
     else
         nulls[col_index] = true;
 
     col_index++;
-    if (ptss->last_file_processed != 0)
-        values[col_index] = TimestampTzGetDatum(ptss->last_file_processed);
-    else
-        nulls[col_index] = true;
-
-    col_index++;
-    values[col_index] = BoolGetDatum(ptss->waiting_for_agent);
+    values[col_index] = BoolGetDatum(telemetry_enabled);
 
     tup = heap_form_tuple(tupdesc, values, nulls);
     result = HeapTupleGetDatum(tup);
@@ -301,7 +340,7 @@ pt_shmem_request(void)
         prev_shmem_request_hook();
 #endif
 
-    RequestAddinShmemSpace(MAXALIGN(sizeof(PTSharedState)));
+    RequestAddinShmemSpace(MAXALIGN(PT_SHARED_STATE_SIZE));
 }
 
 /*
@@ -320,17 +359,18 @@ pt_shmem_init(void)
         uint64 system_id = GetSystemIdentifier();
 
         /* Set paths */
-        pg_snprintf(ptss->dbtemp_filepath, sizeof(ptss->dbtemp_filepath), "%s/%s-%lu.temp", pg_telemetry_folder, PT_FILENAME_BASE, system_id);
-        pg_snprintf(ptss->dbinfo_filepath, sizeof(ptss->dbinfo_filepath), "%s/%s-%lu.json", pg_telemetry_folder, PT_FILENAME_BASE, system_id);
+        strncpy(ptss->pg_telemetry_folder, t_folder, MAXPGPATH);
+        pg_snprintf(ptss->dbtemp_filepath, MAXPGPATH, "%s/%s-%lu.temp", ptss->pg_telemetry_folder, PT_FILENAME_BASE, system_id);
 
         /* Let's be optimistic here. No error code and no file currently being written. */
         ptss->error_code = PT_SUCCESS;
         ptss->write_in_progress = false;
         ptss->json_file_indent = 0;
-        ptss->last_file_processed = 0;
-        ptss->waiting_for_agent = false;
         ptss->first_db_entry = false;
         ptss->last_db_entry = false;
+
+        ptss->curr_file_index = 0;
+        memset(ptss->telemetry_filenames, 0, PT_SHARED_STATE_PREV_FILE_SIZE);
     }
 
     LWLockRelease(AddinShmemInitLock);
@@ -342,31 +382,7 @@ pt_shmem_init(void)
 static void
 init_guc(void)
 {
-    /* file path */
-    DefineCustomStringVariable("percona_telemetry.pg_telemetry_folder",
-                               "Directory path for writing database info file(s)",
-                               NULL,
-                               &pg_telemetry_folder,
-                               "/usr/local/percona/telemetry/pg",
-                               PGC_SIGHUP,
-                               0,
-                               NULL,
-                               NULL,
-                               NULL);
-
-    /* scan time interval for the main launch process */
-    DefineCustomIntVariable("percona_telemetry.scrape_interval",
-                            "Data scrape interval",
-                            NULL,
-                            &scrape_interval,
-                            HOURS_PER_DAY * MINS_PER_HOUR * SECS_PER_MINUTE,
-                            1,
-                            INT_MAX,
-                            PGC_SIGHUP,
-                            GUC_UNIT_S,
-                            NULL,
-                            NULL,
-                            NULL);
+    char       *env;
 
     /* is the extension enabled? */
     DefineCustomBoolVariable("percona_telemetry.enabled",
@@ -379,6 +395,50 @@ init_guc(void)
                              NULL,
                              NULL,
                              NULL);
+
+    env = getenv("PT_DEBUG");
+    if (env != NULL)
+    {
+        /* file path */
+        DefineCustomStringVariable("percona_telemetry.pg_telemetry_folder",
+                                "Directory path for writing database info file(s)",
+                                NULL,
+                                &t_folder,
+                                PT_DEFAULT_FOLDER_PATH,
+                                PGC_SIGHUP,
+                                0,
+                                NULL,
+                                NULL,
+                                NULL);
+
+        /* scan time interval for the main launch process */
+        DefineCustomIntVariable("percona_telemetry.scrape_interval",
+                                "Data scrape interval",
+                                NULL,
+                                &scrape_interval,
+                                HOURS_PER_DAY * MINS_PER_HOUR * SECS_PER_MINUTE,
+                                1,
+                                INT_MAX,
+                                PGC_SIGHUP,
+                                GUC_UNIT_S,
+                                NULL,
+                                NULL,
+                                NULL);
+
+        /* Number of files to keep */
+        DefineCustomIntVariable("percona_telemetry.files_to_keep",
+                                "Number of JSON files to keep for this instance.",
+                                NULL,
+                                &files_to_keep,
+                                7,
+                                1,
+                                100,
+                                PGC_SIGHUP,
+                                0,
+                                NULL,
+                                NULL,
+                                NULL);
+    }
 
 #if PG_VERSION_NUM >= 150000
     MarkGUCPrefixReserved("percona_telemetry");
@@ -433,48 +493,6 @@ setup_background_worker(const char *bgw_function_name, const char *bgw_name, con
      */
     RegisterDynamicBackgroundWorker(&worker, &handle);
     return WaitForBackgroundWorkerShutdown(handle);
-}
-
-/*
- * This function is critical to ensuring that we don't end up dumping files
- * when the agent is not picking up any. Therefore, we keep track of the
- * previously generated file. If it still exists, we don't generate any more.
- *
- * Returns true if the previous file was found otherwise false. In case
- * the file path is a directory, throw an error.
- */
-static bool
-last_file_exists(void)
-{
-    struct stat st;
-
-    /* Assume we are not waiting for the agent. */
-    ptss->waiting_for_agent = false;
-
-    /* We didn't create a file yet. */
-    if (ptss->dbinfo_filepath[0] == '\0')
-        return ptss->waiting_for_agent;
-
-    /* Previous file was not picked up by the agent. */
-    if (stat(ptss->dbinfo_filepath, &st) == 0)
-    {
-        bool is_dir = S_ISDIR(st.st_mode);
-
-        /* Possible case of path corruption as the file path is now a directory */
-        if (is_dir)
-        {
-            ereport(LOG,
-                    (errcode_for_file_access(),
-                     errmsg("file path \"%s\" is not a directory: %m", ptss->dbinfo_filepath)));
-
-            ptss->error_code = PT_FILE_ERROR;
-        }
-
-        ptss->waiting_for_agent = true;
-    }
-
-    /* Previous file was not found. So we're all good. */
-    return ptss->waiting_for_agent;
 }
 
 /*
@@ -761,12 +779,12 @@ write_database_info(PTDatabaseInfo *dbinfo, List *extlist)
     write_json_to_file(fp, msg_json);
 
     /* Construct and write the database OID block. */
-    pg_snprintf(msg, sizeof(msg), "%u", dbinfo->datid);
+    snprintf(msg, sizeof(msg), "%u", dbinfo->datid);
     construct_json_block(msg_json, sz_json, "database_oid", msg, PT_JSON_BLOCK_SIMPLE, &ptss->json_file_indent);
     write_json_to_file(fp, msg_json);
 
     /* Construct and write the database size block. */
-    pg_snprintf(msg, sizeof(msg), "%lu", dbinfo->datsize);
+    snprintf(msg, sizeof(msg), "%lu", dbinfo->datsize);
     construct_json_block(msg_json, sz_json, "database_size", msg, PT_JSON_BLOCK_SIMPLE, &ptss->json_file_indent);
     write_json_to_file(fp, msg_json);
 
@@ -786,7 +804,7 @@ write_database_info(PTDatabaseInfo *dbinfo, List *extlist)
     }
 
     /* Close the array and block and write to file */
-    construct_json_block(msg, sizeof(msg), "active_extensions", "", PT_JSON_ARRAY_END | PT_JSON_BLOCK_END | PT_JSON_BLOCK_LAST, &ptss->json_file_indent);
+    construct_json_block(msg, sizeof(msg), "active_extensions", "active_extensions", PT_JSON_ARRAY_END | PT_JSON_BLOCK_END | PT_JSON_BLOCK_LAST, &ptss->json_file_indent);
     strcpy(msg_json, msg);
     write_json_to_file(fp, msg_json);
 
@@ -851,6 +869,9 @@ percona_telemetry_main(Datum main_arg)
     /* Initialize shmem */
     pt_shmem_init();
 
+    /* Cleanup the directory */
+    cleaup_telemetry_dir();
+
     /* Set up connection */
     BackgroundWorkerInitializeConnectionByOid(InvalidOid, InvalidOid, 0);
 
@@ -889,10 +910,6 @@ percona_telemetry_main(Datum main_arg)
         /* Time to end the loop as the server is shutting down */
 		if ((rc & WL_POSTMASTER_DEATH) || ptss->error_code != PT_SUCCESS)
 			break;
-
-        /* Let's continue to sleep until our last file is picked up by the agent. */
-        if (last_file_exists())
-            continue;
 
         /* We are not processing a cell at the moment. So, let's get the updated database list. */
         if (dblist == NIL && (rc & WL_TIMEOUT || first_time))
@@ -945,8 +962,6 @@ percona_telemetry_main(Datum main_arg)
                 ptss->error_code = PT_FILE_ERROR;
                 break;
             }
-
-            ptss->last_file_processed = GetCurrentTimestamp();
         }
 
         /* Must be a valid list */
@@ -971,20 +986,25 @@ percona_telemetry_main(Datum main_arg)
              */
             if (lc == NULL)
             {
+                char filename[MAXPGPATH] = {0};
+
                 list_free_deep(dblist);
                 dblist = NIL;
 
                 /* We should always have write_in_progress true here. */
                 Assert(ptss->write_in_progress == true);
 
+                /* Generate and save the filename */
+                telemetry_file_next(generate_filename(filename));
+
 	            /* Let's rename the temp file so that agent can pick it up. */
-	            if (rename(ptss->dbtemp_filepath, ptss->dbinfo_filepath) < 0)
+	            if (rename(ptss->dbtemp_filepath, telemetry_curr_filename()) < 0)
 	            {
                     ereport(LOG,
                             (errcode_for_file_access(),
                              errmsg("could not rename file \"%s\" to \"%s\": %m",
                                     ptss->dbtemp_filepath,
-                                    ptss->dbinfo_filepath)));
+                                    telemetry_curr_filename())));
 
                     ptss->error_code = PT_FILE_ERROR;
                     break;

@@ -41,6 +41,7 @@ json_fix_value(char *str)
 {
     int i;
     int len;
+    int maxlen;
     char *str_escaped;
     char *s;
 
@@ -48,9 +49,10 @@ json_fix_value(char *str)
         return NULL;
 
     len = strlen(str);
+    maxlen = (len > 0) ? len * 2 : 1;
 
     /* Max we'd need twice the space. */
-    str_escaped = (char *) palloc(len * 2);
+    str_escaped = (char *) palloc(maxlen);
     s = str_escaped;
 
     for(i = 0; i < len; i++)
@@ -102,21 +104,21 @@ construct_json_block(char *msg_block, size_t msg_block_sz, char *key, char *raw_
 
     if (flags & PT_JSON_KEY_VALUE_PAIR)
     {
-        pg_snprintf(msg, sizeof(msg), "\"%s\": \"%s\",", key, value);
+        snprintf(msg, sizeof(msg), "\"%s\": \"%s\",", key, value);
         PT_FORMAT_JSON(msg_json, sizeof(msg_json), msg, (*json_file_indent));
         strlcat(msg_block, msg_json, msg_block_sz);
     }
 
     if (flags & PT_JSON_BLOCK_KEY)
     {
-        pg_snprintf(msg, sizeof(msg), "\"key\": \"%s\",", key);
+        snprintf(msg, sizeof(msg), "\"key\": \"%s\",", key);
         PT_FORMAT_JSON(msg_json, sizeof(msg_json), msg, (*json_file_indent));
         strlcat(msg_block, msg_json, msg_block_sz);
     }
 
     if (flags & PT_JSON_BLOCK_VALUE)
     {
-        pg_snprintf(msg, sizeof(msg), "\"value\": \"%s\"", value);
+        snprintf(msg, sizeof(msg), "\"value\": \"%s\"", value);
         PT_FORMAT_JSON(msg_json, sizeof(msg_json), msg, (*json_file_indent));
         strlcat(msg_block, msg_json, msg_block_sz);
     }
@@ -124,9 +126,9 @@ construct_json_block(char *msg_block, size_t msg_block_sz, char *key, char *raw_
     if (flags & PT_JSON_ARRAY_START)
     {
         if (value && value[0] != '\0')
-            pg_snprintf(msg, sizeof(msg), "\"%s\": [", value);
+            snprintf(msg, sizeof(msg), "\"%s\": [", value);
         else
-            pg_snprintf(msg, sizeof(msg), "\"value\": [");
+            snprintf(msg, sizeof(msg), "\"value\": [");
 
         PT_FORMAT_JSON(msg_json, sizeof(msg_json), msg, (*json_file_indent));
         strlcat(msg_block, msg_json, msg_block_sz);

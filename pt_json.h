@@ -38,6 +38,16 @@
 #define PT_JSON_BLOCK_SIMPLE            (PT_JSON_BLOCK_EMPTY | PT_JSON_BLOCK_KEY | PT_JSON_BLOCK_VALUE)
 #define PT_JSON_BLOCK_ARRAY_VALUE       (PT_JSON_BLOCK_START | PT_JSON_BLOCK_KEY | PT_JSON_ARRAY_START)
 
+/* JSON Hardcoded keys and values */
+#define PT_JSON_KEY_SETTING             "setting"
+#define PT_JSON_KEY_SETTINGS            "settings"
+#define PT_JSON_KEY_DATABASE            "database"
+#define PT_JSON_KEY_DATABASE_OID        "database_oid"
+#define PT_JSON_KEY_DATABASE_SIZE       "database_size"
+#define PT_JSON_KEY_DATABASES           "databases"
+#define PT_JSON_KEY_ACTIVE_EXTENSIONS   "active_extensions"
+#define PT_JSON_VALUE                   "value"
+
 /* JSON functions */
 bool json_state_init(void);
 bool json_state_validate(void);

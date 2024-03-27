@@ -54,15 +54,16 @@ typedef struct PTExtensionInfo
 typedef struct PTSharedState
 {
     int error_code;
-    bool write_in_progress;
-    char dbtemp_filepath[MAXPGPATH];
-    char dbinfo_filepath[MAXPGPATH];
-    PTDatabaseInfo dbinfo;
     int json_file_indent;
-    TimestampTz last_file_processed;
-    bool waiting_for_agent;
+    PTDatabaseInfo dbinfo;
     bool first_db_entry;
     bool last_db_entry;
+    bool write_in_progress;
+    TimestampTz last_file_processed;
+    int curr_file_index;
+    char pg_telemetry_folder[MAXPGPATH];
+    char dbtemp_filepath[MAXPGPATH];
+    char telemetry_filenames[FLEXIBLE_ARRAY_MEMBER][MAXPGPATH];
 } PTSharedState;
 
 /* Defining error codes */
