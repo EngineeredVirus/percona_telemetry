@@ -533,9 +533,6 @@ write_pg_settings(void)
     /* Open file in append mode. */
     fp = json_file_open(ptss->dbtemp_filepath, "a+");
 
-    /* Initialize JSON state. */
-    json_state_init();
-
     /* Construct and initiate the active extensions array block. */
     construct_json_block(msg_json, sz_json, "", "settings", PT_JSON_ARRAY_START, &ptss->json_file_indent);
     write_json_to_file(fp, msg_json);
@@ -610,15 +607,6 @@ write_pg_settings(void)
 
     /* Clean up */
     fclose(fp);
-
-    /* Validate JSON state. */
-    if (json_state_validate() == false)
-    {
-        ereport(LOG,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("percona_telemetry: malformed json created.")));
-        PT_WORKER_EXIT(PT_JSON_ERROR);
-    }
 
     /* Disconnect from SPI */
     SPI_finish();
@@ -918,11 +906,11 @@ percona_telemetry_main(Datum main_arg)
             Assert(ptss->write_in_progress == false);
             ptss->write_in_progress = true;
 
-            /* Initialise the json state here. We'll validate it when we complete the writing process. */
-            json_state_init();
-
             /* Open file for writing. */
             fp = json_file_open(ptss->dbtemp_filepath, "w");
+
+            construct_json_block(msg_json, sz_json, "", "", PT_JSON_BLOCK_START, &ptss->json_file_indent);
+            write_json_to_file(fp, msg_json);
 
             /* Construct and write the database size block. */
             pg_snprintf(msg, sizeof(msg), "%lu", GetSystemIdentifier());
@@ -945,17 +933,6 @@ percona_telemetry_main(Datum main_arg)
 
             /* Let's close the file now so that processes may add their stuff. */
             fclose(fp);
-
-            /* Validate JSON state. */
-            if (json_state_validate() == false)
-            {
-                ereport(LOG,
-                        (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                            errmsg("percona_telemetry: malformed json created.")));
-
-                ptss->error_code = PT_FILE_ERROR;
-                break;
-            }
         }
 
         /* Must be a valid list */
@@ -987,6 +964,12 @@ percona_telemetry_main(Datum main_arg)
 
                 /* We should always have write_in_progress true here. */
                 Assert(ptss->write_in_progress == true);
+
+                /* Open file, writing the closing bracket and close it. */
+                fp = json_file_open(ptss->dbtemp_filepath, "a+");
+                construct_json_block(msg_json, sz_json, "", "", PT_JSON_BLOCK_END | PT_JSON_BLOCK_LAST, &ptss->json_file_indent);
+                write_json_to_file(fp, msg_json);
+                fclose(fp);
 
                 /* Generate and save the filename */
                 telemetry_file_next(generate_filename(filename));

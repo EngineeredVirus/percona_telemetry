@@ -6,32 +6,6 @@
 /* Local functions */
 static char *json_fix_value(char *str);
 
-/* Local variables */
-static int json_blocks_started = 0;
-static int json_arrays_started = 0;
-
-/*
- * Init json state.
- */
-bool
-json_state_init(void)
-{
-    json_blocks_started = 0;
-    json_arrays_started = 0;
-
-    return true;
-}
-
-/*
- * Do we have unclosed square or curley brackets? If so, then
- * the JSON in our case isn't really valid.
- */
-bool
-json_state_validate(void)
-{
-    return (json_blocks_started == 0 && json_arrays_started == 0);
-}
-
 /*
  * Fixes a JSON string to avoid malformation of a json value. Returns
  * a palloced string that caller must pfree.
@@ -98,7 +72,6 @@ construct_json_block(char *msg_block, size_t msg_block_sz, char *key, char *raw_
         PT_FORMAT_JSON(msg_json, sizeof(msg_json), "{", (*json_file_indent));
         strlcpy(msg_block, msg_json, msg_block_sz);
 
-        json_blocks_started++;
         (*json_file_indent)++;
     }
 
@@ -133,7 +106,6 @@ construct_json_block(char *msg_block, size_t msg_block_sz, char *key, char *raw_
         PT_FORMAT_JSON(msg_json, sizeof(msg_json), msg, (*json_file_indent));
         strlcat(msg_block, msg_json, msg_block_sz);
 
-        json_arrays_started++;
         (*json_file_indent)++;
     }
 
@@ -152,8 +124,6 @@ construct_json_block(char *msg_block, size_t msg_block_sz, char *key, char *raw_
 
         PT_FORMAT_JSON(msg_json, sizeof(msg_json), closing, (*json_file_indent));
         strlcat(msg_block, msg_json, msg_block_sz);
-
-        json_arrays_started--;
     }
 
     /* Value is not an array so we can close the block. */
@@ -171,8 +141,6 @@ construct_json_block(char *msg_block, size_t msg_block_sz, char *key, char *raw_
 
         PT_FORMAT_JSON(msg_json, sizeof(msg_json), closing, (*json_file_indent));
         strlcat(msg_block, msg_json, msg_block_sz);
-
-        json_blocks_started--;
     }
 
     if (value)
